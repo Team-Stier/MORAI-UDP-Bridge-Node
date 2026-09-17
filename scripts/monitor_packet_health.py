@@ -43,6 +43,8 @@ class HealthMonitor:
                 f"send_error={values.get('send_error', '0')}",
                 flush=True,
             )
+        if self.expected <= self.states.keys():
+            rospy.signal_shutdown("all packet channel states logged")
 
 
 def main():
