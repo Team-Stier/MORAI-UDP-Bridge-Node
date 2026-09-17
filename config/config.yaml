@@ -63,7 +63,7 @@ imu:
 
 status:
   enabled: true
-  port: 9094
+  port: 909
   topic: /vehicle/competition_status
   stale_timeout: 0.25
   max_hz: 50.0
