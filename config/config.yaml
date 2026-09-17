@@ -3,15 +3,17 @@ network_launch:
   # 1: same-PC first, then remote-PC. 2: remote-PC only.
   launch_option: 1
   probe_port: 9303
-  probe_timeout_sec: 3.0
+  # Used only before option 1 falls back from same-PC to remote-PC.
+  same_pc_probe_timeout_sec: 3.0
+  wait_log_period_sec: 5.0
   open_ufw_for_remote: true
   same_pc:
     bridge_ip: 127.0.0.1
     simulator_ip: 127.0.0.1
   remote_pc:
     # Set these to the wired-LAN addresses before using option 2/fallback.
-    bridge_ip: ""
-    simulator_ip: ""
+    bridge_ip: "192.168.0.20"
+    simulator_ip: "192.168.0.10"
 
 bind_ip: 0.0.0.0
 allowed_source_ip: ""

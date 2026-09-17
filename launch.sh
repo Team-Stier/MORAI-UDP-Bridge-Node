@@ -2,7 +2,11 @@
 set -euo pipefail
 
 PACKAGE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG="${MORAI_BRIDGE_CONFIG:-${PACKAGE_DIR}/config/config.yaml}"
+PACKAGE_SHARE="$PACKAGE_DIR"
+if command -v rospack >/dev/null 2>&1; then
+    PACKAGE_SHARE="$(rospack find morai_udp_bridge)"
+fi
+CONFIG="${MORAI_BRIDGE_CONFIG:-${PACKAGE_SHARE}/config/config.yaml}"
 ROSLAUNCH_ARGS=()
 
 for arg in "$@"; do
@@ -12,7 +16,7 @@ for arg in "$@"; do
     esac
 done
 
-HELPER="${PACKAGE_DIR}/scripts/network_launch.py"
+HELPER="${PACKAGE_SHARE}/scripts/network_launch.py"
 [[ -f "$HELPER" ]] || HELPER="${PACKAGE_DIR}/network_launch.py"
 RUNTIME_CONFIG="$(python3 "$HELPER" "$CONFIG")"
 exec roslaunch morai_udp_bridge bridge.launch \

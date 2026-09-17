@@ -30,22 +30,26 @@ def require_profile(name, profile):
     return bridge_ip, simulator_ip
 
 
-def receive_probe(name, bridge_ip, simulator_ip, port, timeout):
+def receive_probe(name, bridge_ip, simulator_ip, port, timeout, log_period):
     log(f"probing {name}: {simulator_ip} -> {bridge_ip}:{port}")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock.bind((bridge_ip, port))
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout if timeout is not None else None
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if deadline is not None and time.monotonic() >= deadline:
                 return False
-            sock.settimeout(remaining)
+            wait = log_period
+            if deadline is not None:
+                wait = min(wait, max(0.001, deadline - time.monotonic()))
+            sock.settimeout(wait)
             try:
                 _, sender = sock.recvfrom(65535)
             except socket.timeout:
-                return False
+                if deadline is None:
+                    log(f"waiting for UDP from {simulator_ip} on {bridge_ip}:{port}")
+                continue
             if sender[0] == simulator_ip:
                 log(f"received UDP from {sender[0]}:{sender[1]}")
                 return True
@@ -114,7 +118,8 @@ def prepare(config_path):
     if option not in (1, 2):
         raise RuntimeError("network_launch.launch_option must be 1 or 2")
     port = int(net.get("probe_port", 9303))
-    timeout = float(net.get("probe_timeout_sec", 3.0))
+    same_pc_timeout = float(net.get("same_pc_probe_timeout_sec", 3.0))
+    log_period = float(net.get("wait_log_period_sec", 5.0))
     candidates = []
     if option == 1:
         candidates.append(("same-PC", net.get("same_pc", {}), False))
@@ -126,10 +131,11 @@ def prepare(config_path):
             bridge_ip, simulator_ip = require_profile(name, profile)
             if remote:
                 open_ufw(config, simulator_ip)
-            if receive_probe(name, bridge_ip, simulator_ip, port, timeout):
+            timeout = None if remote else same_pc_timeout
+            if receive_probe(name, bridge_ip, simulator_ip, port, timeout, log_period):
                 log(f"selected {name}: bridge={bridge_ip}, simulator={simulator_ip}")
                 return write_runtime_config(config, bridge_ip, simulator_ip)
-            errors.append(f"{name}: no UDP packet within {timeout:g}s")
+            errors.append(f"{name}: no UDP packet within {same_pc_timeout:g}s")
         except RuntimeError as error:
             errors.append(str(error))
     raise RuntimeError("; ".join(errors) + "; bridge not launched")

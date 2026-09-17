@@ -64,8 +64,8 @@ config에 두고, 전역 `run.sh`가 각 실행 패키지 config에 주입한다
 
 | 값 | 동작 |
 | ---: | --- |
-| `1` | same-PC profile을 먼저 probe한다. timeout까지 packet이 없으면 remote-PC profile을 자동 probe한다. |
-| `2` | same-PC를 건너뛰고 remote-PC profile만 probe한다. |
+| `1` | same-PC profile을 먼저 probe한다. `same_pc_probe_timeout_sec`까지 packet이 없으면 remote-PC profile로 넘어가 계속 기다린다. |
+| `2` | same-PC를 건너뛰고 remote-PC packet이 올 때까지 계속 기다린다. |
 
 각 profile에는 `bridge_ip`와 `simulator_ip`를 둔다. same-PC 기본값은 양쪽 모두
 `127.0.0.1`이다. 두 PC를 유선 LAN으로 연결할 때 remote-PC의 `bridge_ip`에는 브릿지
@@ -75,7 +75,8 @@ PC 유선 NIC 주소, `simulator_ip`에는 MORAI PC 유선 NIC 주소를 넣는�
 network_launch:
   launch_option: 1
   probe_port: 9303
-  probe_timeout_sec: 3.0
+  same_pc_probe_timeout_sec: 3.0
+  wait_log_period_sec: 5.0
   open_ufw_for_remote: true
   same_pc:
     bridge_ip: 127.0.0.1
