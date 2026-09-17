@@ -104,8 +104,8 @@ ImuSample decodeImuPacket(const std::uint8_t* data, std::size_t size,
                           PacketLayout layout);
 
 struct VehicleStatusSample {
-  float source_sec{0.0F};
-  float source_nsec{0.0F};
+  std::int32_t source_sec{0};
+  std::int32_t source_nsec{0};
   std::uint8_t control_mode{0};
   std::uint8_t gear{0};
   float signed_velocity_mps{0.0F};

@@ -783,17 +783,17 @@ Ego Vehicle Status 버전으로 자동 추측하지 않는다.
 | offset | 크기 | 타입 | 의미 |
 | ---: | ---: | --- | --- |
 | 0 | 11 | ASCII | `#MoraiInfo$` |
-| 11 | 4 | uint32 | payload length, 반드시 216 |
+| 11 | 4 | uint32 | payload length, 반드시 152 |
 | 15 | 12 | reserved | auxiliary data, skip |
-| 27 | 216 | bytes | `25.S4.MolitComp03` competition payload |
-| 243 | 2 | ASCII | `\r\n` |
+| 27 | 152 | bytes | `v.S4.251001.MolitComp03` competition payload |
+| 179 | 2 | ASCII | `\r\n` |
 
-전체 길이는 245B여야 한다. 아래 offset은 payload 시작인 byte 27 기준이다.
+전체 길이는 181B여야 한다. 아래 offset은 payload 시작인 byte 27 기준이다.
 
 | payload offset | wire 필드 | wire 타입·단위 | ROS 필드와 변환 |
 | ---: | --- | --- | --- |
-| 0 | `sec` | float32 raw clock | `source_sec` raw copy |
-| 4 | `nsec` | float32 raw clock | `source_nsec` raw copy; 범위 밖이어도 WARN 후 발행 |
+| 0 | `sec` | int32 raw clock | `source_sec` raw copy |
+| 4 | `nsec` | int32 raw clock | `source_nsec` raw copy; 범위 밖이어도 WARN 후 발행 |
 | 8 | `control_mode` | uint8 | `control_mode` |
 | 9 | `gear` | uint8 | `gear` |
 | 10 | `signed_velocity` | float32 km/h | `signed_velocity_mps = value/3.6` |
@@ -811,13 +811,7 @@ Ego Vehicle Status 버전으로 자동 추측하지 않는다.
 | 86,90,94 | `angular_velocity_x/y/z` | float32 degree/s | 각 `*_radps = value*pi/180` |
 | 98,102,106 | `acceleration_x/y/z` | float32 m/s² | 대회 미제공 필드, decode·발행하지 않음 |
 | 110 | `front_steer` | float32 degree | `steering_angle_rad = value*pi/180` |
-| 114 | `rear_steer` | float32 degree | 현재 ROS message에 대응 필드가 없어 decode 후 사용하지 않음 |
-| 118 | `link_id` | char[38] | 첫 NUL까지 ASCII `link_id` |
-| 156..171 | tire lateral force 4개 | 4 x float32 | 현재 ROS message에 대응 필드가 없어 사용하지 않음 |
-| 172..187 | side-slip angle 4개 | 4 x float32 | 현재 ROS message에 대응 필드가 없어 사용하지 않음 |
-| 188..203 | tire cornering stiffness 4개 | 4 x float32 | 현재 ROS message에 대응 필드가 없어 사용하지 않음 |
-| 204..211 | lane-boundary distance 2개 | 2 x float32 | 현재 ROS message에 대응 필드가 없어 사용하지 않음 |
-| 212 | cross-track error | float32 | 현재 ROS message에 대응 필드가 없어 사용하지 않음 |
+| 114 | `link_id` | char[38] | 첫 NUL까지 ASCII `link_id` |
 
 `control_mode`은 `1=Keyboard`, `2=AutoMode`, gear는 `0=M, 1=P, 2=R, 3=N,
 4=D, 5=L` 값을 그대로 전달한다. `map_data_id`는 MORAI 기준 DigitalTwin map
@@ -830,8 +824,8 @@ packet timestamp가 Unix epoch가 아니라 시뮬레이터 시작 기준일 수
 
 ```text
 std_msgs/Header header
-float32 source_sec
-float32 source_nsec
+int32 source_sec
+int32 source_nsec
 uint8 control_mode
 uint8 gear
 float32 signed_velocity_mps
@@ -856,11 +850,10 @@ string link_id
 ```
 
 `header.stamp`는 local receipt time, `header.frame_id`는 주입된 `base_link`다.
-packet에 offset은 있지만 현재 소비자가 사용하지 않는 position, lateral/vertical
-velocity, linear acceleration, rear steer, tire force, side-slip, cornering stiffness,
-lane distance와 cross-track error는 message schema에 넣지 않는다. 브릿지는 이 영역을
-다른 필드로 오인해 읽지 않는다. 향후 필요하면 message 계약과 다이어그램을 먼저
-변경한다. 기존 호환 message에 미제공 float 필드가 남아 있다면 `NaN`을 넣고,
+packet에 있지만 현재 소비자가 사용하지 않는 position, lateral/vertical velocity와
+linear acceleration은 message schema에 넣지 않는다. 브릿지는 이 영역을 다른 필드로
+오인해 읽지 않는다. 향후 필요하면 message 계약과 다이어그램을 먼저 변경한다.
+기존 호환 message에 미제공 float 필드가 남아 있다면 `NaN`을 넣고,
 유효값처럼 보이는 0을 채우지 않는다.
 
 ### CtrlCmd topic ↔ Ego Ctrl Cmd packet
