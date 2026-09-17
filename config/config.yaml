@@ -1,4 +1,18 @@
 # Package-local defaults. Workspace run.sh may overwrite vehicle_spec keys.
+network_launch:
+  # 1: same-PC first, then remote-PC. 2: remote-PC only.
+  launch_option: 1
+  probe_port: 9303
+  probe_timeout_sec: 3.0
+  open_ufw_for_remote: true
+  same_pc:
+    bridge_ip: 127.0.0.1
+    simulator_ip: 127.0.0.1
+  remote_pc:
+    # Set these to the wired-LAN addresses before using option 2/fallback.
+    bridge_ip: ""
+    simulator_ip: ""
+
 bind_ip: 0.0.0.0
 allowed_source_ip: ""
 receive_buffer_bytes: 4194304

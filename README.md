@@ -54,14 +54,57 @@ config에 두고, 전역 `run.sh`가 각 실행 패키지 config에 주입한다
 
 `launch.sh`는 자기 노드만 기동한다. 다른 실행 패키지의 launch를 호출하지 않는다.
 
-`launch.sh`는 shell 재시작 루프를 만들지 않고 다음처럼 package launch 파일을
-`exec roslaunch`한다.
+`launch.sh`는 네트워크 profile을 검증한 뒤 package launch 파일을
+`exec roslaunch`한다. node 재시작 루프는 만들지 않는다.
 
-```sh
-#!/usr/bin/env bash
-set -e
-exec roslaunch morai_udp_bridge bridge.launch
+#### 네트워크 launch option
+
+[`config/config.yaml`](config/config.yaml)의 `network_launch.launch_option`은 다음
+두 값만 받는다.
+
+| 값 | 동작 |
+| ---: | --- |
+| `1` | same-PC profile을 먼저 probe한다. timeout까지 packet이 없으면 remote-PC profile을 자동 probe한다. |
+| `2` | same-PC를 건너뛰고 remote-PC profile만 probe한다. |
+
+각 profile에는 `bridge_ip`와 `simulator_ip`를 둔다. same-PC 기본값은 양쪽 모두
+`127.0.0.1`이다. 두 PC를 유선 LAN으로 연결할 때 remote-PC의 `bridge_ip`에는 브릿지
+PC 유선 NIC 주소, `simulator_ip`에는 MORAI PC 유선 NIC 주소를 넣는다.
+
+```yaml
+network_launch:
+  launch_option: 1
+  probe_port: 9303
+  probe_timeout_sec: 3.0
+  open_ufw_for_remote: true
+  same_pc:
+    bridge_ip: 127.0.0.1
+    simulator_ip: 127.0.0.1
+  remote_pc:
+    bridge_ip: 192.168.10.2
+    simulator_ip: 192.168.10.3
 ```
+
+`launch.sh`는 다음 순서로 실행한다.
+
+1. 선택한 `bridge_ip`가 실제 local NIC에 할당됐는지 확인한다.
+2. remote profile에서는 Ubuntu `ufw`가 활성화된 경우 camera/GPS/IMU/status RX
+   UDP 포트를 `simulator_ip`에 한해서 연다. 비대화식 sudo 권한이 없으면 launch하지
+   않고 필요한 port를 출력한다.
+3. `probe_port`를 잠시 bind하고 지정한 `simulator_ip`에서 실제 UDP datagram이
+   도착하는지 확인한다. probe socket은 node 실행 전에 닫힌다.
+4. 성공한 profile을 원본 YAML에 덮어쓰지 않고 임시 YAML의 `bind_ip`,
+   `allowed_source_ip`, control/lamp `destination_ip`에 주입한다.
+5. 임시 YAML로 `exec roslaunch`한다.
+
+UDP에는 연결 handshake나 ACK가 없으므로 여기서 "연결 성공"은 지정한 MORAI IP에서
+실제 sensor datagram 하나를 받은 상태다. `launch.sh`는 MORAI GUI의 Network Settings를
+변경할 수 없다. MORAI의 각 sensor Destination IP/Port는 선택될 profile의
+`bridge_ip`와 이 YAML의 RX port를 향하도록 미리 설정해야 한다. 특히 option 1의
+remote fallback이 동작하려면 remote MORAI가 이미 remote profile로 송신 중이어야 한다.
+
+`MORAI_BRIDGE_CONFIG=/path/config.yaml ./launch.sh` 또는
+`./launch.sh config:=/path/config.yaml`로 다른 config를 선택할 수 있다.
 
 `bridge.launch`의 node에는 `respawn="true"`, `respawn_delay="1.0"`,
 `output="screen"`을 둔다. segfault, 처리하지 못한 `std::bad_alloc`, 그 밖의 비정상
