@@ -128,37 +128,61 @@ class SocketRecoveryPolicy {
   unsigned int threshold_;
 };
 
-class UdpRxWorker {
+class UdpRxWorkerBase {
  public:
   using BatchHandler = std::function<void(std::vector<Datagram>)>;
   using ResetHandler = std::function<void()>;
-  UdpRxWorker(std::string name, std::string bind_ip, std::uint16_t port,
-              std::string allowed_source_ip, std::size_t receive_buffer,
-              unsigned int reopen_threshold, BatchHandler handler,
-              ResetHandler reset, DiagnosticsReporter* reporter);
-  ~UdpRxWorker();
+  UdpRxWorkerBase(std::string name, std::string allowed_source_ip,
+                  unsigned int reopen_threshold, BatchHandler handler,
+                  ResetHandler reset, DiagnosticsReporter* reporter);
+  virtual ~UdpRxWorkerBase();
   void start();
   void stop();
 
+ protected:
+  const std::string& name() const { return name_; }
+  virtual void ensureSocket() = 0;
+  virtual int receiveDatagram(std::uint8_t* buffer, std::size_t capacity,
+                              Datagram* datagram, int* error) = 0;
+  virtual void resetSocket() = 0;
+
  private:
-  int bindSocket();
-  void closeSocket();
+  bool drainBatch(unsigned int* consecutive_errors);
   void resetRuntimeState();
   void run();
 
   std::string name_;
-  std::string bind_ip_;
-  std::uint16_t port_;
   std::string allowed_source_ip_;
-  std::size_t receive_buffer_;
   SocketRecoveryPolicy recovery_;
   BatchHandler handler_;
   ResetHandler reset_;
   DiagnosticsReporter* reporter_;
   std::atomic<bool> stop_{false};
-  int socket_{-1};
   std::thread thread_;
   std::vector<Datagram> batch_;
+};
+
+class UdpRxWorker final : public UdpRxWorkerBase {
+ public:
+  UdpRxWorker(std::string name, std::string bind_ip, std::uint16_t port,
+              std::string allowed_source_ip, std::size_t receive_buffer,
+              unsigned int reopen_threshold, BatchHandler handler,
+              ResetHandler reset, DiagnosticsReporter* reporter);
+  ~UdpRxWorker();
+
+ private:
+  int bindSocket();
+  void closeSocket();
+  void ensureSocket() override;
+  int receiveDatagram(std::uint8_t* buffer, std::size_t capacity,
+                      Datagram* datagram, int* error) override;
+  void resetSocket() override;
+
+  std::string bind_ip_;
+  std::uint16_t port_;
+  std::size_t receive_buffer_;
+  DiagnosticsReporter* reporter_;
+  int socket_{-1};
 };
 
 class UdpSender {
@@ -176,6 +200,51 @@ class UdpSender {
   unsigned int consecutive_errors_{0};
   int socket_{-1};
   std::vector<std::uint8_t> address_;
+};
+
+class ControlUdpSocket {
+ public:
+  ControlUdpSocket(std::string destination_ip, std::uint16_t destination_port,
+                   std::string bind_ip, std::uint16_t source_port,
+                   std::size_t receive_buffer, unsigned int reopen_threshold);
+  ~ControlUdpSocket();
+  bool send(const std::vector<std::uint8_t>& packet, int* error);
+  int receive(std::uint8_t* buffer, std::size_t capacity,
+              Datagram* datagram, int* error);
+  bool ensureOpen();
+  bool reopen();
+  std::size_t actualReceiveBuffer() const;
+
+ private:
+  bool openLocked();
+  void closeLocked();
+
+  std::string bind_ip_;
+  std::uint16_t source_port_;
+  std::size_t receive_buffer_;
+  unsigned int threshold_;
+  unsigned int consecutive_errors_{0};
+  int socket_{-1};
+  std::size_t actual_receive_buffer_{0};
+  std::vector<std::uint8_t> address_;
+  mutable std::mutex mutex_;
+};
+
+class CompetitionRxWorker final : public UdpRxWorkerBase {
+ public:
+  CompetitionRxWorker(std::string name, std::string allowed_source_ip,
+                      unsigned int reopen_threshold, BatchHandler handler,
+                      ResetHandler reset, DiagnosticsReporter* reporter,
+                      ControlUdpSocket* socket);
+  ~CompetitionRxWorker();
+
+ private:
+  void ensureSocket() override;
+  int receiveDatagram(std::uint8_t* buffer, std::size_t capacity,
+                      Datagram* datagram, int* error) override;
+  void resetSocket() override;
+
+  ControlUdpSocket* socket_;
 };
 
 class LatestCommand {

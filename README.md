@@ -136,7 +136,10 @@ respawn도 동작하지 않으므로 메인 `run.sh`는 `launch.sh` 프로세스
 
 ### 실행 객체와 책임
 
-- `UdpRxWorker`: 포트 하나와 `UdpSocket` 하나를 소유하고 독립 수신 루프를 돈다. 패킷 의미를 해석하지 않는다. front/left/right 카메라도 각각 별도 worker와 socket을 가진다.
+- `UdpRxWorkerBase`: `run()`, `drainBatch()`, source filter, batch 전달과 RX 오류 분기를 한 번만 구현한다. 패킷 의미를 해석하지 않는다.
+- `UdpRxWorker`: 일반 RX 채널의 socket을 직접 소유하고 `UdpRxWorkerBase`의 수신 대상·재생성 대상만 구현한다. front/left/right 카메라도 각각 별도 worker와 socket을 가진다.
+- `CompetitionRxWorker`: MORAI 대회 버전 호환을 위해 `ControlUdpSocket`을 공유한다. `UdpRxWorker`와 다른 부분은 `receiveDatagram()` 대상과 `resetSocket()` 대상뿐이며 나머지 RX 논리는 같은 base 구현이다.
+- `ControlUdpSocket`: control packet을 MORAI `:9093`으로 보내는 source socket을 `status.port`에 bind한다. TX `send()`, Competition RX `receive()`, mutex로 직렬화된 `reopen()`과 fd 수명을 소유한다.
 - `ChannelConfigValidator`: 시작 시 채널별 port, topic, frame/calibration과 TX 제어 상수를 검사한다. unusable config는 해당 채널만 비활성화하고 진단한다.
 - `UdpSourceFilter`: `allowed_source_ip`가 설정된 경우 sender IP만 비교한다. payload를 해석하지 않는다.
 - `LatestDatagramSelector`: GPS, IMU, status의 kernel backlog를 끝까지 비운 batch에서 가장 새로운 structurally decodable datagram 하나만 고른다.
@@ -153,12 +156,12 @@ respawn도 동작하지 않으므로 메인 `run.sh`는 `launch.sh` 프로세스
 
 ### 장애 격리
 
-- RX 포트마다 socket, worker thread, parser, 오류 상태를 분리한다. 한 포트의 문제는 다른 포트와 TX에 전파하지 않는다.
+- 카메라·GPS·IMU RX는 포트마다 socket, worker thread, parser, 오류 상태를 분리한다. Competition RX만 아래에 문서화한 MORAI 호환 동작 때문에 control TX socket을 공유한다. 이 공유 socket을 reopen하는 동안 control TX와 Competition RX만 함께 잠시 멈추며 다른 RX에는 전파되지 않는다.
 - header/길이/tail/checksum이 깨져 필드 위치를 신뢰할 수 없는 packet만 `STRUCTURAL_ERROR`로 버린다. 파싱된 값이 0, 범위 밖, non-finite처럼 이상해 보여도 원본 그대로 발행하고 WARN만 남긴다.
 - `EAGAIN`은 nonblocking socket에 현재 더 읽을 datagram이 없다는 정상 종료 신호다. 오류나 timeout으로 집계하지 않는다. `EINTR`은 같은 호출을 재시도한다.
 - 기타 recv 오류 한 번으로 socket을 닫지 않는다. 일시 오류는 같은 socket으로 계속하고, 연속 오류가 설정된 임계값을 넘거나 descriptor 자체가 무효인 경우에만 해당 socket을 bounded backoff로 다시 연다.
-- worker의 channel 처리에서 `std::bad_alloc` 이외의 `std::exception`이 빠져나오면 해당 채널의 socket, 현재 batch, 연속 오류 상태, parser 임시 상태를 함께 초기화한다. 카메라는 미완성 JPEG assembler도 비운 뒤 bounded backoff로 다시 bind한다. 다른 RX 채널과 TX는 건드리지 않는다. `std::bad_alloc`과 알 수 없는 예외는 감추지 않고 프로세스를 종료해 `roslaunch` respawn에 맡긴다.
-- TX 50Hz timer와 RX worker는 서로 다른 실행 경로다. RX 전체가 끊겨도 TX는 계속 돌고, TX send 실패가 RX를 멈추지 않는다.
+- worker의 channel 처리에서 `std::bad_alloc` 이외의 `std::exception`이 빠져나오면 해당 채널의 socket, 현재 batch, 연속 오류 상태, parser 임시 상태를 함께 초기화한다. 카메라는 미완성 JPEG assembler도 비운 뒤 bounded backoff로 다시 bind한다. Competition RX의 socket reset만 control TX와 공유되고 다른 RX 채널은 건드리지 않는다. `std::bad_alloc`과 알 수 없는 예외는 감추지 않고 프로세스를 종료해 `roslaunch` respawn에 맡긴다.
+- TX 50Hz timer와 RX worker는 서로 다른 실행 경로다. 카메라·GPS·IMU RX가 끊겨도 TX는 계속 돈다. Competition RX와 TX는 실행 경로는 비동기지만 같은 `ControlUdpSocket`을 사용하므로 reopen 구간만 함께 잠시 멈춘다.
 - 반복 오류 로그는 throttle한다. 상태와 카운터 갱신은 생략하지 않는다.
 - 초기 bind 실패나 socket-local 오류로 노드를 종료하지 않는다. 프로세스 종료는 `std::bad_alloc`, 알 수 없는 예외, segfault처럼 현재 process state를 더 신뢰할 수 없는 경우에만 허용하고 외부 respawn에 맡긴다.
 
@@ -177,7 +180,7 @@ respawn도 동작하지 않으므로 메인 `run.sh`는 `launch.sh` 프로세스
 - 이 패키지는 전역 workspace에서 catkin_ws/src/@MORAI-UDP-Bridge_Node 로 깃 서브모듈 링크된다.
 - 실행 패키지끼리 코드·launch 의존성을 만들지 않고 ROS 토픽으로만 연결한다. 커스텀 msg는 서비스 패키지 `catkin_ws/src/interfaces`에만 둔다.
 - package 기본값은 `config/config.yaml`, 공용 차량 제원은 workspace 전역 config와 `run.sh` 주입값이 권위다. `ioniq5_description` 방식은 사용하지 않는다.
-- RX는 포트별 socket·worker thread·오류 상태를 완전히 분리하고, TX 50Hz timer도 RX와 독립 실행한다. 한 채널 오류로 다른 채널이나 프로세스를 종료하지 않는다.
+- 카메라·GPS·IMU RX는 포트별 socket·worker thread·오류 상태를 완전히 분리한다. Competition RX만 control TX socket을 공유하며, 그 외 채널 오류로 다른 채널이나 프로세스를 종료하지 않는다.
 - front/left/right 카메라는 socket, worker, parser, assembler, 진단 상태까지 서로 독립이다.
 - 단일 datagram 센서(GPS, IMU, status)는 socket backlog를 nonblocking으로 비운 뒤 newest-to-oldest 순서로 확인해 가장 최근의 structurally decodable datagram 하나만 처리한다. 건너뛴 datagram은 `superseded_count`로 기록한다.
 - 카메라는 chunk index로 한 JPEG frame만 재조립한다. 새 frame 시작, 조립 제한시간 초과, 잘못된 `max_chunks`, SOI/EOI 불일치 시 미완성 frame 전체를 버리고 부분 JPEG는 발행하지 않는다.
@@ -480,6 +483,90 @@ sequenceDiagram
 | `TxSocketRecoveryPolicy` | `classify(errno, count)` | 일시·network 오류는 socket을 유지하고, socket-local fatal 오류나 설정된 연속 오류에서만 해당 sender를 reopen한다. control sender와 lamp sender 상태는 독립이다. |
 | `DiagnosticsReporter` | `warnAndPublishHighHz()`, `recordSentAndPublishHighHz()`, `publishRichDiagnostics()` | command 처리와 UDP send 결과 직후 같은 TX 실행 경로에서 high-hz 진단을 publish한다. |
 
+### MolitComp03 Control/Competition 공유 소켓
+
+`v.S4.251001.MolitComp03`에서는 Competition Vehicle Status가 Network Settings의
+Publisher destination port가 아니라 Ego Control UDP packet의 source port로 돌아오는
+동작이 실측되었다. 따라서 `ControlUdpSocket`을 `status.port`에 bind하고
+`CompetitionRxWorker`가 그 socket을 공유한다. 이는 해당 버전의 호환 workaround이며
+다른 RX 채널에는 적용하지 않는다.
+
+기존 RX 다이어그램은 `UdpRxWorkerBase::run()`, `drainBatch()`, source filter, batch,
+진단 및 파싱 이후 흐름의 공통 계약으로 그대로 유효하다. `CompetitionRxWorker`는
+`UdpRxWorker`와 비교해 `receiveDatagram()` 대상이 `ControlUdpSocket::receive()`이고
+`resetSocket()` 대상이 `ControlUdpSocket::reopen()`인 것만 다르다. 아래 다이어그램은
+Competition 채널의 socket 소유와 재생성 부분에 한해서 기존 RX/TX 다이어그램보다
+우선한다.
+
+```mermaid
+sequenceDiagram
+    participant Timer as send_timer_ 50Hz
+    participant Node as BridgeNode
+    participant Encoder as MoraiControlEncoder
+    participant Socket as ControlUdpSocket local :9094
+    participant Morai as MORAI :9093
+    participant Rx as CompetitionRxWorker
+    participant Base as UdpRxWorkerBase
+    participant Recovery as SocketRecoveryPolicy
+    participant Bridge as StatusBridge
+    participant Topic as /vehicle/competition_status
+    participant Reporter as DiagnosticsReporter
+
+    par control TX loop
+        loop every 20ms
+            Timer->>Node: onSendTimer()
+            Node->>Encoder: encodeMode1(selected)
+            Encoder-->>Node: 55B packet
+            Node->>Socket: send(packet)
+            Socket->>Morai: sendto(:9093)
+            alt send succeeds
+                Socket-->>Node: true
+            else temporary send error
+                Socket->>Socket: count error, keep fd
+                Socket-->>Node: false, errno
+                Node->>Reporter: sendError(control_tx, errno)
+            else fatal or consecutive send errors
+                Socket->>Socket: openLocked(): close, socket, bind(:9094)
+                Socket-->>Node: false, errno
+                Node->>Reporter: sendError(control_tx, errno)
+            end
+        end
+    and competition status RX loop
+        loop continuously
+            Base->>Base: drainBatch()
+            Rx->>Socket: receiveDatagram(): receive()
+            alt datagram received
+                Socket-->>Rx: Datagram
+                Rx-->>Base: Datagram
+                Base->>Bridge: handle(batch)
+                Bridge->>Bridge: decodeVehicleStatusPacket()
+                Bridge->>Topic: publish(message)
+            else EAGAIN
+                Socket-->>Rx: EAGAIN
+                Rx-->>Base: queue empty
+            else temporary recv error
+                Socket-->>Rx: errno
+                Rx-->>Base: errno
+                Base->>Recovery: classify(errno, count)
+                Recovery-->>Base: keep socket
+                Base->>Reporter: socketError(RECV_ERROR)
+            else fatal or consecutive recv errors
+                Socket-->>Rx: errno
+                Rx-->>Base: errno
+                Base->>Recovery: classify(errno, count)
+                Recovery-->>Base: reopen socket
+                Base->>Reporter: socketError(SOCKET_REOPEN)
+                Base->>Base: resetRuntimeState()
+                Base->>Rx: resetSocket()
+                Rx->>Socket: reopen()
+                Socket->>Socket: lock, close, socket, bind(:9094), unlock
+                Base->>Base: clear batch
+                Base->>Bridge: reset()
+            end
+        end
+    end
+```
+
 주석용 브라우저 뷰어: [`docs/udp-bridge-sequence.html`](docs/udp-bridge-sequence.html)
 
 ## 패킷-토픽 번역 명세
@@ -525,8 +612,10 @@ sequenceDiagram
 
 ### UDP socket과 backlog 정책
 
-- RX 채널마다 `socket()`과 `bind(port)`를 따로 수행하고 전용 `UdpRxWorker`가
-  `recvfrom()`을 호출한다. 공유 수신 queue나 공용 parser thread를 만들지 않는다.
+- 카메라·GPS·IMU RX는 채널마다 `socket()`과 `bind(port)`를 따로 수행하고 전용
+  `UdpRxWorker`가 `recvfrom()`을 호출한다. Competition RX는 `CompetitionRxWorker`가
+  `status.port`에 bind된 `ControlUdpSocket`에서 수신한다. 공유 수신 queue나 공용
+  parser thread는 만들지 않는다.
 - socket은 nonblocking으로 읽으며 `SO_RCVBUF`는 `receive_buffer_bytes` 기본값
   4MiB를 요청한다. 이것은 애플리케이션 FIFO가 아니라 worker가 CPU를 쓰는 동안
   kernel이 UDP datagram을 잠시 보관하는 용량이다. 실제 적용값은 시작 로그와
@@ -783,17 +872,17 @@ Ego Vehicle Status 버전으로 자동 추측하지 않는다.
 | offset | 크기 | 타입 | 의미 |
 | ---: | ---: | --- | --- |
 | 0 | 11 | ASCII | `#MoraiInfo$` |
-| 11 | 4 | uint32 | payload length, 반드시 216 |
+| 11 | 4 | uint32 | payload length, 반드시 152 |
 | 15 | 12 | reserved | auxiliary data, skip |
-| 27 | 216 | bytes | `25.S4.MolitComp03` competition payload |
-| 243 | 2 | ASCII | `\r\n` |
+| 27 | 152 | bytes | `v.S4.251001.MolitComp03` competition payload |
+| 179 | 2 | ASCII | `\r\n` |
 
-전체 길이는 245B여야 한다. 아래 offset은 payload 시작인 byte 27 기준이다.
+전체 길이는 181B여야 한다. 아래 offset은 payload 시작인 byte 27 기준이다.
 
 | payload offset | wire 필드 | wire 타입·단위 | ROS 필드와 변환 |
 | ---: | --- | --- | --- |
-| 0 | `sec` | float32 raw clock | `source_sec` raw copy |
-| 4 | `nsec` | float32 raw clock | `source_nsec` raw copy; 범위 밖이어도 WARN 후 발행 |
+| 0 | `sec` | int32 raw clock | `source_sec` raw copy |
+| 4 | `nsec` | int32 raw clock | `source_nsec` raw copy; 범위 밖이어도 WARN 후 발행 |
 | 8 | `control_mode` | uint8 | `control_mode` |
 | 9 | `gear` | uint8 | `gear` |
 | 10 | `signed_velocity` | float32 km/h | `signed_velocity_mps = value/3.6` |
@@ -811,13 +900,7 @@ Ego Vehicle Status 버전으로 자동 추측하지 않는다.
 | 86,90,94 | `angular_velocity_x/y/z` | float32 degree/s | 각 `*_radps = value*pi/180` |
 | 98,102,106 | `acceleration_x/y/z` | float32 m/s² | 대회 미제공 필드, decode·발행하지 않음 |
 | 110 | `front_steer` | float32 degree | `steering_angle_rad = value*pi/180` |
-| 114 | `rear_steer` | float32 degree | 현재 ROS message에 대응 필드가 없어 decode 후 사용하지 않음 |
-| 118 | `link_id` | char[38] | 첫 NUL까지 ASCII `link_id` |
-| 156..171 | tire lateral force 4개 | 4 x float32 | 현재 ROS message에 대응 필드가 없어 사용하지 않음 |
-| 172..187 | side-slip angle 4개 | 4 x float32 | 현재 ROS message에 대응 필드가 없어 사용하지 않음 |
-| 188..203 | tire cornering stiffness 4개 | 4 x float32 | 현재 ROS message에 대응 필드가 없어 사용하지 않음 |
-| 204..211 | lane-boundary distance 2개 | 2 x float32 | 현재 ROS message에 대응 필드가 없어 사용하지 않음 |
-| 212 | cross-track error | float32 | 현재 ROS message에 대응 필드가 없어 사용하지 않음 |
+| 114 | `link_id` | char[38] | 첫 NUL까지 ASCII `link_id` |
 
 `control_mode`은 `1=Keyboard`, `2=AutoMode`, gear는 `0=M, 1=P, 2=R, 3=N,
 4=D, 5=L` 값을 그대로 전달한다. `map_data_id`는 MORAI 기준 DigitalTwin map
@@ -830,8 +913,8 @@ packet timestamp가 Unix epoch가 아니라 시뮬레이터 시작 기준일 수
 
 ```text
 std_msgs/Header header
-float32 source_sec
-float32 source_nsec
+int32 source_sec
+int32 source_nsec
 uint8 control_mode
 uint8 gear
 float32 signed_velocity_mps
@@ -856,11 +939,10 @@ string link_id
 ```
 
 `header.stamp`는 local receipt time, `header.frame_id`는 주입된 `base_link`다.
-packet에 offset은 있지만 현재 소비자가 사용하지 않는 position, lateral/vertical
-velocity, linear acceleration, rear steer, tire force, side-slip, cornering stiffness,
-lane distance와 cross-track error는 message schema에 넣지 않는다. 브릿지는 이 영역을
-다른 필드로 오인해 읽지 않는다. 향후 필요하면 message 계약과 다이어그램을 먼저
-변경한다. 기존 호환 message에 미제공 float 필드가 남아 있다면 `NaN`을 넣고,
+packet에 있지만 현재 소비자가 사용하지 않는 position, lateral/vertical velocity와
+linear acceleration은 message schema에 넣지 않는다. 브릿지는 이 영역을 다른 필드로
+오인해 읽지 않는다. 향후 필요하면 message 계약과 다이어그램을 먼저 변경한다.
+기존 호환 message에 미제공 float 필드가 남아 있다면 `NaN`을 넣고,
 유효값처럼 보이는 0을 채우지 않는다.
 
 ### CtrlCmd topic ↔ Ego Ctrl Cmd packet

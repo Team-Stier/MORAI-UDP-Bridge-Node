@@ -321,13 +321,13 @@ ImuSample decodeImuPacket(const std::uint8_t* data, std::size_t size,
 
 VehicleStatusSample decodeVehicleStatusPacket(const std::uint8_t* data,
                                                std::size_t size) {
-  if (!data || size != 245U || !startsWith(data, size, "#MoraiInfo$", 11U) ||
-      readU32(data + 11U) != 216U || data[243U] != '\r' || data[244U] != '\n')
+  if (!data || size != 181U || !startsWith(data, size, "#MoraiInfo$", 11U) ||
+      readU32(data + 11U) != 152U || data[179U] != '\r' || data[180U] != '\n')
     throw ProtocolError("competition status envelope malformed");
   const std::uint8_t* p = data + 27U;
   VehicleStatusSample s;
-  s.source_sec = readF32(p);
-  s.source_nsec = readF32(p + 4U);
+  s.source_sec = readI32(p);
+  s.source_nsec = readI32(p + 4U);
   s.control_mode = p[8U];
   s.gear = p[9U];
   s.signed_velocity_mps = readF32(p + 10U) / 3.6F;
@@ -349,7 +349,7 @@ VehicleStatusSample decodeVehicleStatusPacket(const std::uint8_t* data,
   s.angular_velocity_y_radps = readF32(p + 90U) * deg;
   s.angular_velocity_z_radps = readF32(p + 94U) * deg;
   s.steering_angle_rad = readF32(p + 110U) * deg;
-  const char* link = reinterpret_cast<const char*>(p + 118U);
+  const char* link = reinterpret_cast<const char*>(p + 114U);
   s.link_id.assign(link, std::find(link, link + 38U, '\0'));
   return s;
 }

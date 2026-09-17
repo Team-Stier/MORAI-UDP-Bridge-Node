@@ -398,19 +398,109 @@ SocketAction SocketRecoveryPolicy::classify(int error,
   return SocketAction::kKeep;
 }
 
+UdpRxWorkerBase::UdpRxWorkerBase(std::string name,
+                                 std::string allowed_source_ip,
+                                 unsigned int reopen_threshold,
+                                 BatchHandler handler, ResetHandler reset,
+                                 DiagnosticsReporter* reporter)
+    : name_(std::move(name)),
+      allowed_source_ip_(std::move(allowed_source_ip)),
+      recovery_(reopen_threshold), handler_(std::move(handler)),
+      reset_(std::move(reset)), reporter_(reporter) {
+  if (!handler_ || !reset_ || !reporter_) throw std::invalid_argument("invalid RX worker dependency");
+}
+
+UdpRxWorkerBase::~UdpRxWorkerBase() { stop(); }
+
+void UdpRxWorkerBase::start() {
+  stop_.store(false);
+  thread_ = std::thread(&UdpRxWorkerBase::run, this);
+}
+
+void UdpRxWorkerBase::stop() {
+  stop_.store(true);
+  if (thread_.joinable()) thread_.join();
+}
+
+void UdpRxWorkerBase::resetRuntimeState() {
+  resetSocket();
+  batch_.clear();
+  reset_();
+}
+
+bool UdpRxWorkerBase::drainBatch(unsigned int* consecutive_errors) {
+  std::array<std::uint8_t, 65535U> buffer{};
+  while (!stop_.load()) {
+    Datagram datagram;
+    int error = 0;
+    const int received = receiveDatagram(buffer.data(), buffer.size(), &datagram, &error);
+    if (received > 0) {
+      *consecutive_errors = 0U;
+      reporter_->received(name_, datagram);
+      if (!allowed_source_ip_.empty() && datagram.sender != allowed_source_ip_) {
+        reporter_->rejected(name_, datagram);
+      } else {
+        batch_.push_back(std::move(datagram));
+      }
+      continue;
+    }
+    if (error == EAGAIN || error == EWOULDBLOCK) return true;
+    ++*consecutive_errors;
+    const SocketAction action = recovery_.classify(error, *consecutive_errors);
+    if (action == SocketAction::kRetryImmediately) continue;
+    reporter_->socketError(name_, action == SocketAction::kReopen ? "SOCKET_REOPEN" : "RECV_ERROR",
+                           std::string("recvfrom: ") + std::strerror(error), ros::Time::now());
+    if (action == SocketAction::kReopen) {
+      resetRuntimeState();
+      *consecutive_errors = 0U;
+    }
+    return false;
+  }
+  return false;
+}
+
+void UdpRxWorkerBase::run() {
+  unsigned int consecutive_errors = 0U;
+  std::chrono::milliseconds backoff(100);
+  while (!stop_.load() && ros::ok()) {
+    try {
+      ensureSocket();
+      const bool drained = drainBatch(&consecutive_errors);
+      if (drained && !batch_.empty()) {
+        std::vector<Datagram> batch;
+        batch.swap(batch_);
+        handler_(std::move(batch));
+      } else if (batch_.empty()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      backoff = std::chrono::milliseconds(100);
+    } catch (const std::bad_alloc&) {
+      throw;
+    } catch (const std::exception& error) {
+      reporter_->workerException(name_, error.what(), ros::Time::now());
+      ROS_ERROR("%s worker exception: %s", name_.c_str(), error.what());
+      resetRuntimeState();
+      consecutive_errors = 0U;
+      std::this_thread::sleep_for(backoff);
+      backoff = std::min(backoff * 2, std::chrono::milliseconds(2000));
+    }
+  }
+}
+
 UdpRxWorker::UdpRxWorker(std::string name, std::string bind_ip,
                          std::uint16_t port, std::string allowed_source_ip,
                          std::size_t receive_buffer,
                          unsigned int reopen_threshold, BatchHandler handler,
                          ResetHandler reset, DiagnosticsReporter* reporter)
-    : name_(std::move(name)), bind_ip_(std::move(bind_ip)), port_(port),
-      allowed_source_ip_(std::move(allowed_source_ip)), receive_buffer_(receive_buffer),
-      recovery_(reopen_threshold), handler_(std::move(handler)), reset_(std::move(reset)),
-      reporter_(reporter) {
-  if (!handler_ || !reset_ || !reporter_) throw std::invalid_argument("invalid RX worker dependency");
-}
+    : UdpRxWorkerBase(name, std::move(allowed_source_ip), reopen_threshold,
+                      std::move(handler), std::move(reset), reporter),
+      bind_ip_(std::move(bind_ip)), port_(port), receive_buffer_(receive_buffer),
+      reporter_(reporter) {}
 
-UdpRxWorker::~UdpRxWorker() { stop(); }
+UdpRxWorker::~UdpRxWorker() {
+  stop();
+  closeSocket();
+}
 
 int UdpRxWorker::bindSocket() {
   const int fd = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -446,7 +536,7 @@ int UdpRxWorker::bindSocket() {
 #ifdef __linux__
   actual /= 2;
 #endif
-  reporter_->setSocketBuffer(name_, receive_buffer_, static_cast<std::size_t>(std::max(actual, 0)));
+  reporter_->setSocketBuffer(name(), receive_buffer_, static_cast<std::size_t>(std::max(actual, 0)));
   return fd;
 }
 
@@ -457,84 +547,28 @@ void UdpRxWorker::closeSocket() {
   }
 }
 
-void UdpRxWorker::resetRuntimeState() {
-  closeSocket();
-  batch_.clear();
-  reset_();
+void UdpRxWorker::ensureSocket() {
+  if (socket_ < 0) socket_ = bindSocket();
 }
 
-void UdpRxWorker::start() { thread_ = std::thread(&UdpRxWorker::run, this); }
-
-void UdpRxWorker::stop() {
-  stop_.store(true);
-  closeSocket();
-  if (thread_.joinable()) thread_.join();
-}
-
-void UdpRxWorker::run() {
-  std::array<std::uint8_t, 65535U> buffer{};
-  unsigned int consecutive_errors = 0U;
-  std::chrono::milliseconds backoff(100);
-  while (!stop_.load() && ros::ok()) {
-    try {
-      if (socket_ < 0) {
-        socket_ = bindSocket();
-        consecutive_errors = 0U;
-        backoff = std::chrono::milliseconds(100);
-      }
-      bool drained = false;
-      while (!stop_.load()) {
-        sockaddr_in sender{};
-        socklen_t sender_size = sizeof(sender);
-        const ssize_t count = recvfrom(socket_, buffer.data(), buffer.size(), 0,
-                                       reinterpret_cast<sockaddr*>(&sender), &sender_size);
-        if (count >= 0) {
-          consecutive_errors = 0U;
-          Datagram datagram;
-          datagram.bytes.assign(buffer.begin(), buffer.begin() + count);
-          datagram.sender = senderIp(sender);
-          datagram.ros_receipt = ros::Time::now();
-          datagram.steady_receipt = SteadyClock::now();
-          reporter_->received(name_, datagram);
-          if (!allowed_source_ip_.empty() && datagram.sender != allowed_source_ip_) {
-            reporter_->rejected(name_, datagram);
-          } else {
-            batch_.push_back(std::move(datagram));
-          }
-          continue;
-        }
-        const int error = errno;
-        if (error == EAGAIN || error == EWOULDBLOCK) {
-          drained = true;
-          break;
-        }
-        ++consecutive_errors;
-        const SocketAction action = recovery_.classify(error, consecutive_errors);
-        if (action == SocketAction::kRetryImmediately) continue;
-        reporter_->socketError(name_, action == SocketAction::kReopen ? "SOCKET_REOPEN" : "RECV_ERROR",
-                               std::string("recvfrom: ") + std::strerror(error), ros::Time::now());
-        if (action == SocketAction::kReopen) resetRuntimeState();
-        break;
-      }
-      if (drained && !batch_.empty()) {
-        std::vector<Datagram> batch;
-        batch.swap(batch_);
-        handler_(std::move(batch));
-      } else if (batch_.empty()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      }
-    } catch (const std::bad_alloc&) {
-      throw;
-    } catch (const std::exception& error) {
-      reporter_->workerException(name_, error.what(), ros::Time::now());
-      ROS_ERROR("%s worker exception: %s", name_.c_str(), error.what());
-      resetRuntimeState();
-      std::this_thread::sleep_for(backoff);
-      backoff = std::min(backoff * 2, std::chrono::milliseconds(2000));
-    }
+int UdpRxWorker::receiveDatagram(std::uint8_t* buffer, std::size_t capacity,
+                                 Datagram* datagram, int* error) {
+  sockaddr_in sender{};
+  socklen_t sender_size = sizeof(sender);
+  const ssize_t count = recvfrom(socket_, buffer, capacity, 0,
+                                 reinterpret_cast<sockaddr*>(&sender), &sender_size);
+  if (count < 0) {
+    *error = errno;
+    return -1;
   }
-  closeSocket();
+  datagram->bytes.assign(buffer, buffer + count);
+  datagram->sender = senderIp(sender);
+  datagram->ros_receipt = ros::Time::now();
+  datagram->steady_receipt = SteadyClock::now();
+  return 1;
 }
+
+void UdpRxWorker::resetSocket() { closeSocket(); }
 
 UdpSender::UdpSender(std::string ip, std::uint16_t port,
                      unsigned int reopen_threshold)
@@ -579,6 +613,152 @@ bool UdpSender::send(const std::vector<std::uint8_t>& packet, int* error) {
   if (fatalSocketError(*error) || consecutive_errors_ >= threshold_) open();
   return false;
 }
+
+ControlUdpSocket::ControlUdpSocket(std::string destination_ip,
+                                   std::uint16_t destination_port,
+                                   std::string bind_ip,
+                                   std::uint16_t source_port,
+                                   std::size_t receive_buffer,
+                                   unsigned int reopen_threshold)
+    : bind_ip_(std::move(bind_ip)), source_port_(source_port),
+      receive_buffer_(receive_buffer), threshold_(reopen_threshold) {
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(destination_port);
+  if (inet_pton(AF_INET, destination_ip.c_str(), &address.sin_addr) != 1)
+    throw std::invalid_argument("invalid destination IP: " + destination_ip);
+  address_.resize(sizeof(address));
+  std::memcpy(address_.data(), &address, sizeof(address));
+  if (!reopen()) throw std::runtime_error("cannot bind control UDP socket");
+}
+
+ControlUdpSocket::~ControlUdpSocket() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  closeLocked();
+}
+
+void ControlUdpSocket::closeLocked() {
+  if (socket_ >= 0) ::close(socket_);
+  socket_ = -1;
+  actual_receive_buffer_ = 0U;
+}
+
+bool ControlUdpSocket::openLocked() {
+  closeLocked();
+  socket_ = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (socket_ < 0) return false;
+  const auto fail = [this]() {
+    const int error = errno;
+    closeLocked();
+    errno = error;
+    return false;
+  };
+  const int flags = fcntl(socket_, F_GETFL, 0);
+  if (flags < 0 || fcntl(socket_, F_SETFL, flags | O_NONBLOCK) < 0) return fail();
+  const int requested = static_cast<int>(receive_buffer_);
+  if (setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, &requested, sizeof(requested)) != 0)
+    return fail();
+  sockaddr_in local{};
+  local.sin_family = AF_INET;
+  local.sin_port = htons(source_port_);
+  if (bind_ip_.empty() || bind_ip_ == "0.0.0.0") local.sin_addr.s_addr = INADDR_ANY;
+  else if (inet_pton(AF_INET, bind_ip_.c_str(), &local.sin_addr) != 1) {
+    errno = EINVAL;
+    return fail();
+  }
+  if (::bind(socket_, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) return fail();
+  int actual = 0;
+  socklen_t length = sizeof(actual);
+  if (getsockopt(socket_, SOL_SOCKET, SO_RCVBUF, &actual, &length) != 0) return fail();
+#ifdef __linux__
+  actual /= 2;
+#endif
+  actual_receive_buffer_ = static_cast<std::size_t>(std::max(actual, 0));
+  consecutive_errors_ = 0U;
+  return true;
+}
+
+bool ControlUdpSocket::ensureOpen() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return socket_ >= 0 || openLocked();
+}
+
+bool ControlUdpSocket::reopen() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return openLocked();
+}
+
+std::size_t ControlUdpSocket::actualReceiveBuffer() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return actual_receive_buffer_;
+}
+
+bool ControlUdpSocket::send(const std::vector<std::uint8_t>& packet, int* error) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (socket_ < 0 && !openLocked()) {
+    *error = errno;
+    return false;
+  }
+  const ssize_t sent = sendto(socket_, packet.data(), packet.size(), 0,
+                              reinterpret_cast<const sockaddr*>(address_.data()),
+                              static_cast<socklen_t>(address_.size()));
+  if (sent == static_cast<ssize_t>(packet.size())) {
+    consecutive_errors_ = 0U;
+    return true;
+  }
+  *error = sent < 0 ? errno : EMSGSIZE;
+  ++consecutive_errors_;
+  if (fatalSocketError(*error) || consecutive_errors_ >= threshold_) openLocked();
+  return false;
+}
+
+int ControlUdpSocket::receive(std::uint8_t* buffer, std::size_t capacity,
+                              Datagram* datagram, int* error) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (socket_ < 0 && !openLocked()) {
+    *error = errno;
+    return -1;
+  }
+  sockaddr_in sender{};
+  socklen_t sender_size = sizeof(sender);
+  const ssize_t count = recvfrom(socket_, buffer, capacity, 0,
+                                 reinterpret_cast<sockaddr*>(&sender), &sender_size);
+  if (count < 0) {
+    *error = errno;
+    return -1;
+  }
+  datagram->bytes.assign(buffer, buffer + count);
+  datagram->sender = senderIp(sender);
+  datagram->ros_receipt = ros::Time::now();
+  datagram->steady_receipt = SteadyClock::now();
+  return 1;
+}
+
+CompetitionRxWorker::CompetitionRxWorker(
+    std::string name, std::string allowed_source_ip,
+    unsigned int reopen_threshold, BatchHandler handler, ResetHandler reset,
+    DiagnosticsReporter* reporter, ControlUdpSocket* socket)
+    : UdpRxWorkerBase(std::move(name), std::move(allowed_source_ip),
+                      reopen_threshold, std::move(handler), std::move(reset),
+                      reporter),
+      socket_(socket) {
+  if (!socket_) throw std::invalid_argument("competition RX socket is null");
+}
+
+CompetitionRxWorker::~CompetitionRxWorker() { stop(); }
+
+void CompetitionRxWorker::ensureSocket() {
+  if (!socket_->ensureOpen())
+    throw std::runtime_error(std::string("control socket open: ") + std::strerror(errno));
+}
+
+int CompetitionRxWorker::receiveDatagram(std::uint8_t* buffer,
+                                         std::size_t capacity,
+                                         Datagram* datagram, int* error) {
+  return socket_->receive(buffer, capacity, datagram, error);
+}
+
+void CompetitionRxWorker::resetSocket() { socket_->reopen(); }
 
 void LatestCommand::store(const ControlCommand& command,
                           SteadyClock::time_point receipt) {
