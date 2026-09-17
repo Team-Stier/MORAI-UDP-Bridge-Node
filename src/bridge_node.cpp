@@ -1,8 +1,11 @@
 #include <cmath>
+#include <arpa/inet.h>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <string>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -43,19 +46,80 @@ class ChannelConfigValidator {
   static void validatePositive(double value, const std::string& name) {
     if (!std::isfinite(value) || value <= 0.0) throw std::runtime_error(name + " must be positive");
   }
+  static void validateTopic(const std::string& topic) {
+    std::string error;
+    if (topic.empty() || !ros::names::validate(topic, error))
+      throw std::runtime_error("invalid topic: " + topic + " " + error);
+  }
+  static void validateFrame(const std::string& frame) {
+    if (frame.empty()) throw std::runtime_error("frame_id is empty");
+  }
+  static void validateIp(const std::string& ip, bool allow_empty = false) {
+    in_addr address{};
+    if (allow_empty && ip.empty()) return;
+    if (inet_pton(AF_INET, ip.c_str(), &address) != 1)
+      throw std::runtime_error("invalid IPv4 address: " + ip);
+  }
+  static void validateRx(const ros::NodeHandle& config, int port,
+                         const std::string& topic, double stale_timeout) {
+    validatePort(port);
+    validateTopic(topic);
+    validatePositive(stale_timeout, "stale_timeout");
+    validatePositive(param(config, "receive_buffer_bytes", 4194304), "receive_buffer_bytes");
+    validatePositive(param(config, "recv_error_reopen_threshold", 3), "recv_error_reopen_threshold");
+    validateIp(param(config, "bind_ip", std::string("0.0.0.0")), true);
+    validateIp(param(config, "allowed_source_ip", std::string()), true);
+  }
+  static void validateTx(const ros::NodeHandle& config, const std::string& prefix) {
+    validatePort(requiredParam<int>(config, prefix + "/destination_port"));
+    validateTopic(requiredParam<std::string>(config, prefix + "/command_topic"));
+    validateIp(requiredParam<std::string>(config, prefix + "/destination_ip"));
+    validatePositive(requiredParam<int>(config, prefix + "/send_error_reopen_threshold"), "send_error_reopen_threshold");
+    if (prefix == "control") {
+      validatePositive(requiredParam<double>(config, "control/send_rate_hz"), "send_rate_hz");
+      validatePositive(requiredParam<double>(config, "control/command_timeout_sec"), "command_timeout_sec");
+      const double brake = requiredParam<double>(config, "control/safe_brake_command");
+      if (!std::isfinite(brake) || brake < 0.0 || brake > 1.0)
+        throw std::runtime_error("safe_brake_command is outside 0..1");
+    }
+  }
+};
+
+struct CameraParser {
+  static CameraPacket decodeStructure(const Datagram& packet, PacketLayout layout) {
+    return decodeCameraPacket(packet.bytes.data(), packet.bytes.size(), layout);
+  }
+};
+struct GpsParser {
+  static GgaFix decodeStructure(const Datagram& packet) {
+    return decodeGgaDatagram(packet.bytes.data(), packet.bytes.size());
+  }
+};
+struct ImuParser {
+  static ImuSample decodeStructure(const Datagram& packet, PacketLayout layout) {
+    return decodeImuPacket(packet.bytes.data(), packet.bytes.size(), layout);
+  }
+};
+struct StatusParser {
+  static VehicleStatusSample decodeStructure(const Datagram& packet) {
+    return decodeVehicleStatusPacket(packet.bytes.data(), packet.bytes.size());
+  }
 };
 
 class RxValueInspector {
  public:
   static std::string camera(const CameraPacket& packet) {
-    if (packet.declared_size == 0U) return "camera declared size is zero";
     if (packet.has_timestamp && packet.nsec >= 1000000000U) return "camera nsec is outside range";
     return {};
   }
   static std::string gps(const GgaFix& fix) {
+    if (fix.coordinate_anomaly) return "GGA coordinate is non-finite or outside range";
     if (fix.quality < 0 || fix.satellites < 0) return "GGA quality or satellites is negative";
     if ((fix.has_latitude && !std::isfinite(fix.latitude)) ||
         (fix.has_longitude && !std::isfinite(fix.longitude))) return "GGA coordinate is non-finite";
+    if (fix.has_hdop && (!std::isfinite(fix.hdop) || fix.hdop < 0)) return "GGA HDOP is suspicious";
+    if ((fix.has_altitude_msl && !std::isfinite(fix.altitude_msl)) ||
+        (fix.has_geoid_separation && !std::isfinite(fix.geoid_separation))) return "GGA altitude is non-finite";
     return {};
   }
   static std::string imu(const ImuSample& sample) {
@@ -79,6 +143,15 @@ class RxValueInspector {
       return "status nsec is outside range";
     if (sample.control_mode < 1U || sample.control_mode > 2U) return "status control_mode is unknown";
     if (sample.gear > 5U) return "status gear is unknown";
+    if (sample.map_data_id < 0 || sample.map_data_id > 19999) return "status map_data_id is outside range";
+    const float values[] = {sample.signed_velocity_mps, sample.accel, sample.brake,
+      sample.size_x_m, sample.size_y_m, sample.size_z_m, sample.overhang_m,
+      sample.wheelbase_m, sample.rear_overhang_m, sample.roll_rad, sample.pitch_rad,
+      sample.yaw_rad, sample.velocity_x_mps, sample.angular_velocity_x_radps,
+      sample.angular_velocity_y_radps, sample.angular_velocity_z_radps, sample.steering_angle_rad};
+    for (float value : values) if (!std::isfinite(value)) return "status contains non-finite value";
+    if (sample.accel < 0 || sample.accel > 1 || sample.brake < 0 || sample.brake > 1)
+      return "status pedal is outside range";
     return {};
   }
 };
@@ -95,6 +168,7 @@ class CameraBridge {
     ChannelConfigValidator::validatePositive(width_, "camera width");
     ChannelConfigValidator::validatePositive(height_, "camera height");
     ChannelConfigValidator::validatePositive(horizontal_fov_deg_, "camera FOV");
+    if (horizontal_fov_deg_ >= 180.0) throw std::runtime_error("camera FOV must be below 180 degrees");
     if (frame_id_.empty()) throw std::runtime_error("camera frame_id is empty");
     image_publisher_ = node.advertise<sensor_msgs::CompressedImage>(topic, 1, false);
     info_publisher_ = node.advertise<sensor_msgs::CameraInfo>(info_topic, 1, false);
@@ -103,17 +177,21 @@ class CameraBridge {
   void handle(std::vector<Datagram> batch) {
     for (const Datagram& datagram : batch) {
       try {
-        CameraPacket packet = decodeCameraPacket(datagram.bytes.data(), datagram.bytes.size(), layout_);
+        CameraPacket packet = CameraParser::decodeStructure(datagram, layout_);
+        reporter_->recordChunk(name_);
         const std::string anomaly = RxValueInspector::camera(packet);
-        if (!anomaly.empty()) reporter_->valueAnomaly(name_, anomaly, datagram.ros_receipt);
+        reporter_->valueAnomaly(name_, anomaly, datagram.ros_receipt);
         std::string drop_reason;
         CameraFrame frame;
-        if (assembler_.add(std::move(packet), datagram.steady_receipt, &frame, &drop_reason)) {
-          publish(translateToRosMessage(frame, datagram.ros_receipt));
-          reporter_->published(name_, datagram.ros_receipt, frame.first_receipt,
+        const bool complete = assembler_.add(std::move(packet), datagram.steady_receipt,
+                                             &frame, &drop_reason, datagram.ros_receipt.toNSec());
+        if (!drop_reason.empty()) reporter_->dropped(name_, drop_reason, datagram.ros_receipt);
+        if (complete) {
+          ros::Time first_receipt;
+          first_receipt.fromNSec(frame.first_ros_receipt_ns);
+          publish(translateToRosMessage(frame, first_receipt));
+          reporter_->published(name_, first_receipt, frame.first_receipt,
                                frame.source_sec, frame.source_nsec);
-        } else if (!drop_reason.empty()) {
-          reporter_->dropped(name_, drop_reason, datagram.ros_receipt);
         }
       } catch (const ProtocolError& error) {
         reporter_->parseError(name_, error.what(), datagram.ros_receipt);
@@ -173,13 +251,14 @@ class GpsBridge {
   void handle(std::vector<Datagram> batch) {
     std::size_t rejected = 0U;
     std::size_t non_target = 0U;
-    for (std::size_t i = batch.size(); i > 0U; --i) {
-      const Datagram& datagram = batch[i - 1U];
-      try {
-        const GgaFix fix = decodeGgaDatagram(datagram.bytes.data(), datagram.bytes.size());
-        reporter_->superseded("gps", i - 1U);
+    std::size_t selected = 0;
+    GgaFix fix;
+    if (LatestDatagramSelector::selectNewestDecodable(batch, GpsParser::decodeStructure,
+          &fix, &selected, &rejected, &non_target)) {
+        const Datagram& datagram = batch[selected];
+        reporter_->superseded("gps", selected);
         const std::string anomaly = RxValueInspector::gps(fix);
-        if (!anomaly.empty()) reporter_->valueAnomaly("gps", anomaly, datagram.ros_receipt);
+        reporter_->valueAnomaly("gps", anomaly, datagram.ros_receipt);
         publisher_.publish(translateToRosMessage(fix, datagram.ros_receipt));
         reporter_->setExtra("gps", "gga_utc", fix.utc);
         reporter_->setExtra("gps", "quality", std::to_string(fix.quality));
@@ -187,11 +266,6 @@ class GpsBridge {
         reporter_->setExtra("gps", "hdop", fix.has_hdop ? std::to_string(fix.hdop) : "nan");
         reporter_->published("gps", datagram.ros_receipt, datagram.steady_receipt);
         return;
-      } catch (const NonTargetPacket&) {
-        ++non_target;
-      } catch (const ProtocolError&) {
-        ++rejected;
-      }
     }
     const ros::Time stamp = batch.back().ros_receipt;
     if (non_target == batch.size()) reporter_->ignored("gps", "NON_GGA", stamp);
@@ -211,8 +285,8 @@ class GpsBridge {
                                            : sensor_msgs::NavSatStatus::STATUS_NO_FIX;
     message.latitude = fix.has_latitude ? fix.latitude : std::numeric_limits<double>::quiet_NaN();
     message.longitude = fix.has_longitude ? fix.longitude : std::numeric_limits<double>::quiet_NaN();
-    message.altitude = fix.has_altitude_msl
-                           ? fix.altitude_msl + (fix.has_geoid_separation ? fix.geoid_separation : 0.0)
+    message.altitude = fix.has_altitude_msl && fix.has_geoid_separation
+                           ? fix.altitude_msl + fix.geoid_separation
                            : std::numeric_limits<double>::quiet_NaN();
     message.position_covariance.fill(0.0);
     message.position_covariance_type = sensor_msgs::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
@@ -232,19 +306,19 @@ class ImuBridge {
     publisher_ = node.advertise<sensor_msgs::Imu>(topic, 1, false);
   }
   void handle(std::vector<Datagram> batch) {
-    for (std::size_t i = batch.size(); i > 0U; --i) {
-      const Datagram& datagram = batch[i - 1U];
-      try {
-        const ImuSample sample = decodeImuPacket(datagram.bytes.data(), datagram.bytes.size(), layout_);
-        reporter_->superseded("imu", i - 1U);
+    std::size_t selected = 0, rejected = 0, non_target = 0;
+    ImuSample sample;
+    if (LatestDatagramSelector::selectNewestDecodable(batch,
+          [this](const Datagram& packet) { return ImuParser::decodeStructure(packet, layout_); },
+          &sample, &selected, &rejected, &non_target)) {
+        const Datagram& datagram = batch[selected];
+        reporter_->superseded("imu", selected);
         const std::string anomaly = RxValueInspector::imu(sample);
-        if (!anomaly.empty()) reporter_->valueAnomaly("imu", anomaly, datagram.ros_receipt);
+        reporter_->valueAnomaly("imu", anomaly, datagram.ros_receipt);
         publisher_.publish(translateToRosMessage(sample, datagram.ros_receipt));
         reporter_->published("imu", datagram.ros_receipt, datagram.steady_receipt,
                              sample.sec, sample.nsec);
         return;
-      } catch (const ProtocolError&) {
-      }
     }
     reporter_->parseError("imu", "no structurally decodable IMU packet", batch.back().ros_receipt);
   }
@@ -288,19 +362,18 @@ class StatusBridge {
     publisher_ = node.advertise<interfaces::CompetitionVehicleStatus>(topic, 1, false);
   }
   void handle(std::vector<Datagram> batch) {
-    for (std::size_t i = batch.size(); i > 0U; --i) {
-      const Datagram& datagram = batch[i - 1U];
-      try {
-        const VehicleStatusSample sample = decodeVehicleStatusPacket(datagram.bytes.data(), datagram.bytes.size());
-        reporter_->superseded("status", i - 1U);
+    std::size_t selected = 0, rejected = 0, non_target = 0;
+    VehicleStatusSample sample;
+    if (LatestDatagramSelector::selectNewestDecodable(batch, StatusParser::decodeStructure,
+          &sample, &selected, &rejected, &non_target)) {
+        const Datagram& datagram = batch[selected];
+        reporter_->superseded("status", selected);
         const std::string anomaly = RxValueInspector::status(sample);
-        if (!anomaly.empty()) reporter_->valueAnomaly("status", anomaly, datagram.ros_receipt);
+        reporter_->valueAnomaly("status", anomaly, datagram.ros_receipt);
         publisher_.publish(translateToRosMessage(sample, datagram.ros_receipt));
         reporter_->published("status", datagram.ros_receipt, datagram.steady_receipt,
                              sample.source_sec, sample.source_nsec);
         return;
-      } catch (const ProtocolError&) {
-      }
     }
     reporter_->parseError("status", "no structurally decodable status packet", batch.back().ros_receipt);
   }
@@ -342,6 +415,117 @@ class StatusBridge {
   ros::Publisher publisher_;
 };
 
+std::string describe(const ControlCommand& command) {
+  std::ostringstream text;
+  text << std::setprecision(17) << "accel=" << command.accel << ",brake=" << command.brake
+       << ",steering=" << command.steering;
+  return text.str();
+}
+
+std::string describe(const LampCommand& command) {
+  return "turnSignal=" + std::to_string(command.turn_signal) +
+         ",emergencySignal=" + std::to_string(command.emergency_signal);
+}
+
+void sendAndRecover(const std::string& channel, UdpSender& sender,
+                    const TxSocketRecoveryPolicy& recovery,
+                    const std::vector<std::uint8_t>& packet,
+                    DiagnosticsReporter& reporter, SteadyClock::time_point started) {
+  int error = 0;
+  if (sender.send(packet, &error)) {
+    reporter.sent(channel, ros::Time::now(), started);
+    return;
+  }
+  reporter.sendError(channel, std::strerror(error), ros::Time::now());
+  if (recovery.classify(error, sender.consecutiveErrors()) == SocketAction::kReopen) {
+    reporter.socketError(channel, "SOCKET_REOPEN", std::strerror(error), ros::Time::now());
+    if (sender.reopen()) {
+      reporter.recovered(channel, "SOCKET_RECOVERED", ros::Time::now());
+    } else {
+      reporter.socketError(channel, "SOCKET_REOPEN", std::strerror(errno), ros::Time::now());
+    }
+  }
+}
+
+class ControlTx {
+ public:
+  ControlTx(ros::NodeHandle node, const ros::NodeHandle& config, DiagnosticsReporter& reporter)
+      : reporter_(reporter),
+        freshness_(requiredParam<double>(config, "control/command_timeout_sec"),
+                   requiredParam<double>(config, "control/safe_brake_command")),
+        sender_(requiredParam<std::string>(config, "control/destination_ip"),
+                requiredParam<int>(config, "control/destination_port")),
+        recovery_(requiredParam<int>(config, "control/send_error_reopen_threshold")) {
+    subscriber_ = node.subscribe<morai_msgs::CtrlCmd>(
+        requiredParam<std::string>(config, "control/command_topic"), 1,
+        &ControlTx::onCommand, this, ros::TransportHints().tcpNoDelay());
+    timer_ = node.createWallTimer(ros::WallDuration(1.0 / requiredParam<double>(config, "control/send_rate_hz")),
+                                  &ControlTx::onSendTimer, this);
+  }
+
+  void onCommand(const morai_msgs::CtrlCmd::ConstPtr& message) {
+    const ros::Time receipt = ros::Time::now();
+    const auto steady_receipt = SteadyClock::now();
+    const ControlCommand raw{message->accel, message->brake, message->steering};
+    const SanitizedControl sanitized = sanitizer_.sanitize(raw);
+    latest_.store(sanitized.command, steady_receipt);
+    reporter_.commandAccepted(sanitized.changed, receipt, steady_receipt,
+                              describe(raw), describe(sanitized.command));
+  }
+
+  void onSendTimer(const ros::WallTimerEvent&) {
+    const auto started = SteadyClock::now();
+    ControlCommand latest;
+    double age = 0;
+    const bool has_command = latest_.snapshot(&latest, &age);
+    bool stale = false;
+    const ControlCommand selected = freshness_.select(has_command, latest, age, &stale);
+    reporter_.staleFallback("control_tx", age, ros::Time::now(), stale);
+    sendAndRecover("control_tx", sender_, recovery_, encoder_.encodeMode1(selected), reporter_, started);
+  }
+
+ private:
+  DiagnosticsReporter& reporter_;
+  ControlCommandSanitizer sanitizer_;
+  LatestCommand latest_;
+  CommandFreshnessGuard freshness_;
+  MoraiControlEncoder encoder_;
+  UdpSender sender_;
+  TxSocketRecoveryPolicy recovery_;
+  ros::Subscriber subscriber_;
+  ros::WallTimer timer_;
+};
+
+class LampTx {
+ public:
+  LampTx(ros::NodeHandle node, const ros::NodeHandle& config, DiagnosticsReporter& reporter)
+      : reporter_(reporter),
+        sender_(requiredParam<std::string>(config, "lamp_control/destination_ip"),
+                requiredParam<int>(config, "lamp_control/destination_port")),
+        recovery_(requiredParam<int>(config, "lamp_control/send_error_reopen_threshold")) {
+    subscriber_ = node.subscribe<morai_msgs::Lamps>(
+        requiredParam<std::string>(config, "lamp_control/command_topic"), 1,
+        &LampTx::onLamps, this, ros::TransportHints().tcpNoDelay());
+  }
+
+  void onLamps(const morai_msgs::Lamps::ConstPtr& message) {
+    const auto started = SteadyClock::now();
+    const LampCommand raw{message->turnSignal, message->emergencySignal};
+    const SanitizedLamp sanitized = sanitizer_.sanitize(raw);
+    reporter_.commandAccepted(sanitized.changed, ros::Time::now(), started,
+                              describe(raw), describe(sanitized.command), "lamp_tx");
+    sendAndRecover("lamp_tx", sender_, recovery_, encoder_.encode(sanitized.command), reporter_, started);
+  }
+
+ private:
+  DiagnosticsReporter& reporter_;
+  LampCommandSanitizer sanitizer_;
+  MoraiLampEncoder encoder_;
+  UdpSender sender_;
+  TxSocketRecoveryPolicy recovery_;
+  ros::Subscriber subscriber_;
+};
+
 class BridgeNode {
  public:
   BridgeNode() : node_(), private_("~"),
@@ -349,8 +533,16 @@ class BridgeNode {
                 param(private_, "high_hz_diagnostics_topic", std::string("/diagnostics/high_hz")),
                 param(private_, "diagnostics_period", 1.0)) {
     setupRx();
-    setupControl();
-    setupLamp();
+    configureChannel("control_tx", "control", "tx", [this]() {
+      ChannelConfigValidator::validateTx(private_, "control");
+      control_.reset(new ControlTx(node_, private_, reporter_));
+    });
+    if (param(private_, "lamp_control/enabled", false)) {
+      configureChannel("lamp_tx", "lamp_control", "tx", [this]() {
+        ChannelConfigValidator::validateTx(private_, "lamp_control");
+        lamp_.reset(new LampTx(node_, private_, reporter_));
+      });
+    }
     stale_timer_ = node_.createWallTimer(ros::WallDuration(0.05), [this](const ros::WallTimerEvent&) {
       reporter_.checkStale();
     });
@@ -360,12 +552,32 @@ class BridgeNode {
     for (auto& worker : workers_) worker->start();
   }
 
+  ~BridgeNode() {
+    for (auto& worker : workers_) worker->stop();
+  }
+
  private:
+  template <typename Setup>
+  void configureChannel(const std::string& name, const std::string& prefix,
+                         const std::string& direction, Setup setup) {
+    const bool rx = direction == "rx";
+    const int port = param(private_, prefix + (rx ? "/port" : "/destination_port"), 0);
+    reporter_.addChannel(name, direction, port > 0 && port <= 65535 ? port : 0,
+        param(private_, prefix + (rx ? "/topic" : "/command_topic"), std::string()),
+        rx ? param(private_, prefix + "/stale_timeout", 0.0) : 0.0);
+    try {
+      setup();
+    } catch (const std::bad_alloc&) {
+      throw;
+    } catch (const std::exception& error) {
+      reporter_.configError(name, error.what());
+    }
+  }
+
   void addWorker(const std::string& name, int port, const std::string& topic,
                  double stale_timeout, UdpRxWorker::BatchHandler handler,
                  UdpRxWorker::ResetHandler reset) {
-    ChannelConfigValidator::validatePort(port);
-    reporter_.addChannel(name, "rx", static_cast<std::uint16_t>(port), topic, stale_timeout);
+    ChannelConfigValidator::validateRx(private_, port, topic, stale_timeout);
     workers_.emplace_back(new UdpRxWorker(
         name, param(private_, "bind_ip", std::string("0.0.0.0")),
         static_cast<std::uint16_t>(port), param(private_, "allowed_source_ip", std::string()),
@@ -377,13 +589,14 @@ class BridgeNode {
   void setupRx() {
     const std::string cameras[] = {"front", "left", "right"};
     for (const std::string& camera : cameras) {
+      configureChannel("camera_" + camera, "cameras/" + camera, "rx", [this, &camera]() {
       const std::string prefix = "cameras/" + camera + "/";
       const int port = requiredParam<int>(private_, prefix + "port");
       const std::string topic = requiredParam<std::string>(private_, prefix + "topic");
       const std::string info_topic = requiredParam<std::string>(private_, prefix + "camera_info_topic");
       const double stale = requiredParam<double>(private_, prefix + "stale_timeout");
-      reporter_.addChannel("camera_" + camera, "rx", port, topic, stale);
-      try {
+      ChannelConfigValidator::validateRx(private_, port, topic, stale);
+      ChannelConfigValidator::validateTopic(info_topic);
         std::unique_ptr<CameraBridge> bridge(new CameraBridge(
             node_, "camera_" + camera, topic, info_topic,
             requiredParam<std::string>(private_, "vehicle_spec/cameras/" + camera + "/frame_id"),
@@ -400,110 +613,49 @@ class BridgeNode {
             param(private_, "recv_error_reopen_threshold", 3),
             [raw](std::vector<Datagram> batch) { raw->handle(std::move(batch)); },
             [raw]() { raw->reset(); }, &reporter_));
-      } catch (const std::exception& error) {
-        reporter_.configError("camera_" + camera, error.what());
-      }
+      });
     }
 
     if (param(private_, "gps/enabled", true)) {
+      configureChannel("gps", "gps", "rx", [this]() {
       const int port = requiredParam<int>(private_, "gps/port");
       const std::string topic = requiredParam<std::string>(private_, "gps/topic");
       const double stale = requiredParam<double>(private_, "gps/stale_timeout");
+      ChannelConfigValidator::validateRx(private_, port, topic, stale);
+      ChannelConfigValidator::validateFrame(requiredParam<std::string>(private_, "vehicle_spec/gps_frame_id"));
       gps_.reset(new GpsBridge(node_, topic, requiredParam<std::string>(private_, "vehicle_spec/gps_frame_id"), &reporter_));
       addWorker("gps", port, topic, stale,
                 [this](std::vector<Datagram> batch) { gps_->handle(std::move(batch)); },
                 [this]() { gps_->reset(); });
+      });
     }
     if (param(private_, "imu/enabled", true)) {
+      configureChannel("imu", "imu", "rx", [this]() {
       const int port = requiredParam<int>(private_, "imu/port");
       const std::string topic = requiredParam<std::string>(private_, "imu/topic");
       const double stale = requiredParam<double>(private_, "imu/stale_timeout");
+      ChannelConfigValidator::validateRx(private_, port, topic, stale);
+      ChannelConfigValidator::validateFrame(requiredParam<std::string>(private_, "vehicle_spec/imu_frame_id"));
       imu_.reset(new ImuBridge(node_, topic, requiredParam<std::string>(private_, "vehicle_spec/imu_frame_id"),
                                packetLayoutFromString(requiredParam<std::string>(private_, "imu/packet_layout")), &reporter_));
       addWorker("imu", port, topic, stale,
                 [this](std::vector<Datagram> batch) { imu_->handle(std::move(batch)); },
                 [this]() { imu_->reset(); });
+      });
     }
     if (param(private_, "status/enabled", true)) {
+      configureChannel("status", "status", "rx", [this]() {
       const int port = requiredParam<int>(private_, "status/port");
       const std::string topic = requiredParam<std::string>(private_, "status/topic");
       const double stale = requiredParam<double>(private_, "status/stale_timeout");
+      ChannelConfigValidator::validateRx(private_, port, topic, stale);
+      ChannelConfigValidator::validateFrame(requiredParam<std::string>(private_, "vehicle_spec/base_frame_id"));
       status_.reset(new StatusBridge(node_, topic, requiredParam<std::string>(private_, "vehicle_spec/base_frame_id"), &reporter_));
       addWorker("status", port, topic, stale,
                 [this](std::vector<Datagram> batch) { status_->handle(std::move(batch)); },
                 [this]() { status_->reset(); });
+      });
     }
-  }
-
-  void setupControl() {
-    const int port = requiredParam<int>(private_, "control/destination_port");
-    ChannelConfigValidator::validatePort(port);
-    const double rate = requiredParam<double>(private_, "control/send_rate_hz");
-    ChannelConfigValidator::validatePositive(rate, "control send_rate_hz");
-    reporter_.addChannel("control_tx", "tx", port,
-                         requiredParam<std::string>(private_, "control/command_topic"), 0.0);
-    control_sender_.reset(new UdpSender(requiredParam<std::string>(private_, "control/destination_ip"), port,
-                                        requiredParam<int>(private_, "control/send_error_reopen_threshold")));
-    freshness_.reset(new CommandFreshnessGuard(
-        requiredParam<double>(private_, "control/command_timeout_sec"),
-        requiredParam<double>(private_, "control/safe_brake_command")));
-    control_subscriber_ = node_.subscribe<morai_msgs::CtrlCmd>(
-        requiredParam<std::string>(private_, "control/command_topic"), 1,
-        &BridgeNode::onCommand, this, ros::TransportHints().tcpNoDelay());
-    send_timer_ = node_.createWallTimer(ros::WallDuration(1.0 / rate), &BridgeNode::onSendTimer, this);
-  }
-
-  void setupLamp() {
-    if (!param(private_, "lamp_control/enabled", false)) return;
-    const int port = requiredParam<int>(private_, "lamp_control/destination_port");
-    ChannelConfigValidator::validatePort(port);
-    reporter_.addChannel("lamp_tx", "tx", port,
-                         requiredParam<std::string>(private_, "lamp_control/command_topic"), 0.0);
-    lamp_sender_.reset(new UdpSender(requiredParam<std::string>(private_, "lamp_control/destination_ip"), port,
-                                     requiredParam<int>(private_, "lamp_control/send_error_reopen_threshold")));
-    lamp_subscriber_ = node_.subscribe<morai_msgs::Lamps>(
-        requiredParam<std::string>(private_, "lamp_control/command_topic"), 1,
-        &BridgeNode::onLamps, this, ros::TransportHints().tcpNoDelay());
-  }
-
-  void onCommand(const morai_msgs::CtrlCmd::ConstPtr& message) {
-    const ros::Time receipt = ros::Time::now();
-    ControlCommand raw;
-    raw.accel = message->accel;
-    raw.brake = message->brake;
-    raw.steering = message->steering;
-    const SanitizedControl sanitized = sanitizer_.sanitize(raw);
-    if (sanitized.changed) ROS_WARN_THROTTLE(1.0, "control command sanitized: %s", sanitized.reason.c_str());
-    latest_.store(sanitized.command, SteadyClock::now());
-    reporter_.commandAccepted(sanitized.changed, receipt);
-  }
-
-  void onSendTimer(const ros::WallTimerEvent&) {
-    const auto started = SteadyClock::now();
-    ControlCommand latest;
-    double age = 0.0;
-    const bool has_command = latest_.snapshot(&latest, &age);
-    bool stale = false;
-    const ControlCommand selected = freshness_->select(has_command, latest, age, &stale);
-    if (stale) reporter_.staleFallback("control_tx", age, ros::Time::now());
-    else reporter_.recovered("control_tx", "STALE_COMMAND_RECOVERED", ros::Time::now());
-    const std::vector<std::uint8_t> packet = control_encoder_.encodeMode1(selected);
-    int error = 0;
-    if (control_sender_->send(packet, &error)) reporter_.sent("control_tx", ros::Time::now(), started);
-    else reporter_.sendError("control_tx", std::strerror(error), ros::Time::now());
-  }
-
-  void onLamps(const morai_msgs::Lamps::ConstPtr& message) {
-    const auto started = SteadyClock::now();
-    LampCommand raw;
-    raw.turn_signal = message->turnSignal;
-    raw.emergency_signal = message->emergencySignal;
-    const SanitizedLamp sanitized = lamp_sanitizer_.sanitize(raw);
-    if (sanitized.changed) reporter_.valueAnomaly("lamp_tx", "lamp value replaced with off", ros::Time::now());
-    int error = 0;
-    if (lamp_sender_->send(lamp_encoder_.encode(sanitized.command), &error))
-      reporter_.sent("lamp_tx", ros::Time::now(), started);
-    else reporter_.sendError("lamp_tx", std::strerror(error), ros::Time::now());
   }
 
   ros::NodeHandle node_;
@@ -514,17 +666,8 @@ class BridgeNode {
   std::unique_ptr<GpsBridge> gps_;
   std::unique_ptr<ImuBridge> imu_;
   std::unique_ptr<StatusBridge> status_;
-  ControlCommandSanitizer sanitizer_;
-  MoraiControlEncoder control_encoder_;
-  LatestCommand latest_;
-  std::unique_ptr<CommandFreshnessGuard> freshness_;
-  std::unique_ptr<UdpSender> control_sender_;
-  LampCommandSanitizer lamp_sanitizer_;
-  MoraiLampEncoder lamp_encoder_;
-  std::unique_ptr<UdpSender> lamp_sender_;
-  ros::Subscriber control_subscriber_;
-  ros::Subscriber lamp_subscriber_;
-  ros::WallTimer send_timer_;
+  std::unique_ptr<ControlTx> control_;
+  std::unique_ptr<LampTx> lamp_;
   ros::WallTimer stale_timer_;
 };
 

@@ -25,7 +25,7 @@ PacketLayout packetLayoutFromString(const std::string& value);
 
 struct CameraPacket {
   std::uint32_t index{0};
-  std::uint32_t declared_size{0};
+  std::uint32_t payload_size{0};
   std::vector<std::uint8_t> payload;
   bool final{false};
   bool has_timestamp{false};
@@ -38,6 +38,7 @@ struct CameraFrame {
   std::uint32_t source_sec{0};
   std::uint32_t source_nsec{0};
   std::chrono::steady_clock::time_point first_receipt;
+  std::uint64_t first_ros_receipt_ns{0};
 };
 
 CameraPacket decodeCameraPacket(const std::uint8_t* data, std::size_t size,
@@ -48,12 +49,14 @@ class CameraFrameAssembler {
   CameraFrameAssembler(std::size_t max_chunks,
                        std::chrono::milliseconds timeout);
   bool add(CameraPacket packet, std::chrono::steady_clock::time_point receipt,
-           CameraFrame* frame, std::string* drop_reason);
+           CameraFrame* frame, std::string* drop_reason,
+           std::uint64_t ros_receipt_ns = 0);
   void reset();
 
  private:
   void start(const CameraPacket& packet,
-             std::chrono::steady_clock::time_point receipt);
+             std::chrono::steady_clock::time_point receipt,
+             std::uint64_t ros_receipt_ns);
   bool active_{false};
   bool has_key_{false};
   std::uint32_t key_sec_{0};
@@ -65,6 +68,7 @@ class CameraFrameAssembler {
   std::size_t max_chunks_;
   std::chrono::milliseconds timeout_;
   std::chrono::steady_clock::time_point first_receipt_;
+  std::uint64_t first_ros_receipt_ns_{0};
   std::map<std::uint32_t, std::vector<std::uint8_t>> chunks_;
 };
 
@@ -74,6 +78,7 @@ struct GgaFix {
   bool has_longitude{false};
   double latitude{0.0};
   double longitude{0.0};
+  bool coordinate_anomaly{false};
   int quality{0};
   int satellites{0};
   bool has_hdop{false};

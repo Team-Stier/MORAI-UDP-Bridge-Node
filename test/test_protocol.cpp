@@ -144,5 +144,50 @@ TEST(LampProtocol, InvalidFieldsBecomeOff) {
   EXPECT_EQ(0, result.command.emergency_signal);
 }
 
+TEST(CameraProtocol, FrameKeepsFirstChunkReceiptAcrossAssemblyAndReset) {
+  CameraFrameAssembler assembler(256U, std::chrono::milliseconds(200));
+  const auto start = std::chrono::steady_clock::now();
+  CameraPacket first;
+  first.index = 0;
+  first.payload = {0xff, 0xd8, 0x01};
+  CameraPacket last;
+  last.index = 1;
+  last.final = true;
+  last.payload = {0x02, 0xff, 0xd9};
+  CameraFrame frame;
+  std::string reason;
+  EXPECT_FALSE(assembler.add(first, start, &frame, &reason, 1000000001ULL));
+  ASSERT_TRUE(assembler.add(last, start + std::chrono::milliseconds(20), &frame, &reason, 1020000001ULL));
+  EXPECT_EQ(1000000001ULL, frame.first_ros_receipt_ns);
+  EXPECT_EQ(start, frame.first_receipt);
+  first.payload = {0xff, 0xd8, 0xff, 0xd9};
+  first.final = true;
+  ASSERT_TRUE(assembler.add(first, start, &frame, &reason, 2000000001ULL));
+  EXPECT_EQ(2000000001ULL, frame.first_ros_receipt_ns);
+}
+
+TEST(CameraProtocol, UsesDeclaredChunkSizeAndDiscardsDatagramPadding) {
+  std::vector<std::uint8_t> packet(65000U, 0xaaU);
+  std::memcpy(packet.data(), "MOR", 3U);
+  writeU32(&packet, 15U, 3U);
+  packet[19U] = 0xffU;
+  packet[20U] = 0xd8U;
+  packet[21U] = 0xd9U;
+  packet[64998U] = 'E';
+  packet[64999U] = 'I';
+
+  const CameraPacket decoded =
+      decodeCameraPacket(packet.data(), packet.size(), PacketLayout::kTimestamped);
+  EXPECT_EQ(3U, decoded.payload_size);
+  EXPECT_EQ((std::vector<std::uint8_t>{0xffU, 0xd8U, 0xd9U}), decoded.payload);
+}
+
+TEST(GpsProtocol, OutOfRangeCoordinatesAreObservationsNotDrops) {
+  const std::string sentence = withChecksum("GPGGA,123519,9963.0,N,19902.0,E,1,03,5.2,10.0,M,20.0,M,,");
+  const auto fix = decodeGgaDatagram(reinterpret_cast<const std::uint8_t*>(sentence.data()), sentence.size());
+  EXPECT_TRUE(fix.coordinate_anomaly);
+  EXPECT_NEAR(100.05, fix.latitude, 1e-9);
+}
+
 }  // namespace
 }  // namespace morai_udp_bridge

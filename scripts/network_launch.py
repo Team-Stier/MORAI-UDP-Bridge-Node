@@ -5,13 +5,68 @@ import socket
 import subprocess
 import sys
 import tempfile
-import time
 
 import yaml
 
 
 def log(message):
     print(f"[morai_udp_bridge] {message}", file=sys.stderr, flush=True)
+
+
+def run_privileged(command):
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    subprocess.run(prefix + command, check=True)
+
+
+def assigned_interface(ip):
+    result = subprocess.run(
+        ["ip", "-o", "-4", "addr", "show"],
+        check=True, capture_output=True, text=True,
+    )
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and fields[3].split("/", 1)[0] == ip:
+            return fields[1]
+    return ""
+
+
+def detect_wired_interface():
+    candidates = []
+    for name in sorted(os.listdir("/sys/class/net")):
+        root = f"/sys/class/net/{name}"
+        if name == "lo" or os.path.exists(f"{root}/wireless") or not os.path.exists(f"{root}/device"):
+            continue
+        try:
+            with open(f"{root}/carrier", encoding="ascii") as stream:
+                if stream.read().strip() == "1":
+                    candidates.append(name)
+        except OSError:
+            continue
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "cannot uniquely detect connected wired NIC: " +
+            (", ".join(candidates) if candidates else "none")
+        )
+    return candidates[0]
+
+
+def configure_remote_interface(profile):
+    if not shutil.which("ip"):
+        log("ip command unavailable; using preconfigured host network")
+        return
+    bridge_ip = str(profile.get("bridge_ip", ""))
+    simulator_ip = str(profile.get("simulator_ip", ""))
+    interface = assigned_interface(bridge_ip)
+    if not interface:
+        interface = str(profile.get("interface", "")) or detect_wired_interface()
+        prefix = int(profile.get("prefix_length", 24))
+        log(f"configuring wired NIC {interface}: {bridge_ip}/{prefix}")
+        run_privileged(["ip", "link", "set", "dev", interface, "up"])
+        run_privileged(["ip", "addr", "replace", f"{bridge_ip}/{prefix}", "dev", interface])
+    run_privileged([
+        "ip", "route", "replace", f"{simulator_ip}/32", "dev", interface,
+        "src", bridge_ip,
+    ])
 
 
 def require_profile(name, profile):
@@ -28,33 +83,6 @@ def require_profile(name, profile):
             f"{name} bridge_ip is not assigned locally: {bridge_ip}: {error}"
         ) from error
     return bridge_ip, simulator_ip
-
-
-def receive_probe(name, bridge_ip, simulator_ip, port, timeout, log_period):
-    log(f"probing {name}: {simulator_ip} -> {bridge_ip}:{port}")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        sock.bind((bridge_ip, port))
-        deadline = time.monotonic() + timeout if timeout is not None else None
-        while True:
-            if deadline is not None and time.monotonic() >= deadline:
-                return False
-            wait = log_period
-            if deadline is not None:
-                wait = min(wait, max(0.001, deadline - time.monotonic()))
-            sock.settimeout(wait)
-            try:
-                _, sender = sock.recvfrom(65535)
-            except socket.timeout:
-                if deadline is None:
-                    log(f"waiting for UDP from {simulator_ip} on {bridge_ip}:{port}")
-                continue
-            if sender[0] == simulator_ip:
-                log(f"received UDP from {sender[0]}:{sender[1]}")
-                return True
-    finally:
-        sock.close()
 
 
 def rx_ports(config):
@@ -97,9 +125,9 @@ def open_ufw(config, simulator_ip):
             ) from error
 
 
-def write_runtime_config(config, bridge_ip, simulator_ip):
+def write_runtime_config(config, bridge_ip, simulator_ip, allowed_source_ip=None):
     config["bind_ip"] = bridge_ip
-    config["allowed_source_ip"] = simulator_ip
+    config["allowed_source_ip"] = simulator_ip if allowed_source_ip is None else allowed_source_ip
     config.setdefault("control", {})["destination_ip"] = simulator_ip
     if config.get("lamp_control", {}).get("enabled", False):
         config["lamp_control"]["destination_ip"] = simulator_ip
@@ -117,28 +145,26 @@ def prepare(config_path):
     option = int(net.get("launch_option", 1))
     if option not in (1, 2):
         raise RuntimeError("network_launch.launch_option must be 1 or 2")
-    port = int(net.get("probe_port", 9303))
-    same_pc_timeout = float(net.get("same_pc_probe_timeout_sec", 3.0))
-    log_period = float(net.get("wait_log_period_sec", 5.0))
-    candidates = []
-    if option == 1:
-        candidates.append(("same-PC", net.get("same_pc", {}), False))
-    candidates.append(("remote-PC", net.get("remote_pc", {}), True))
+    name = "same-PC" if option == 1 else "remote-PC"
+    profile = net.get("same_pc" if option == 1 else "remote_pc", {})
+    remote = option == 2
 
-    errors = []
-    for name, profile, remote in candidates:
-        try:
-            bridge_ip, simulator_ip = require_profile(name, profile)
-            if remote:
-                open_ufw(config, simulator_ip)
-            timeout = None if remote else same_pc_timeout
-            if receive_probe(name, bridge_ip, simulator_ip, port, timeout, log_period):
-                log(f"selected {name}: bridge={bridge_ip}, simulator={simulator_ip}")
-                return write_runtime_config(config, bridge_ip, simulator_ip)
-            errors.append(f"{name}: no UDP packet within {same_pc_timeout:g}s")
-        except RuntimeError as error:
-            errors.append(str(error))
-    raise RuntimeError("; ".join(errors) + "; bridge not launched")
+    if remote and not shutil.which("ip"):
+        bridge_ip = "0.0.0.0"
+        simulator_ip = str(profile.get("simulator_ip", ""))
+        if not simulator_ip:
+            raise RuntimeError(f"{name} simulator_ip is not configured")
+        open_ufw(config, simulator_ip)
+        log(f"selected {name}: bridge={bridge_ip}, simulator={simulator_ip}")
+        return write_runtime_config(config, bridge_ip, simulator_ip, "")
+
+    if remote:
+        configure_remote_interface(profile)
+    bridge_ip, simulator_ip = require_profile(name, profile)
+    if remote:
+        open_ufw(config, simulator_ip)
+    log(f"selected {name}: bridge={bridge_ip}, simulator={simulator_ip}")
+    return write_runtime_config(config, bridge_ip, simulator_ip)
 
 
 if __name__ == "__main__":

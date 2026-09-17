@@ -54,8 +54,10 @@ config에 두고, 전역 `run.sh`가 각 실행 패키지 config에 주입한다
 
 `launch.sh`는 자기 노드만 기동한다. 다른 실행 패키지의 launch를 호출하지 않는다.
 
-`launch.sh`는 네트워크 profile을 검증한 뒤 package launch 파일을
-`exec roslaunch`한다. node 재시작 루프는 만들지 않는다.
+`launch.sh`는 네트워크 profile을 검증한 뒤 package launch 파일의 `roslaunch`와
+packet-health helper를 자식 프로세스로 실행하고 `roslaunch`를 `wait`한다.
+helper는 채널별 수신 상태를 로그로 남긴 뒤 종료하며, node 재시작은
+`roslaunch`의 respawn이 담당한다. 스크립트에 별도 node 재시작 루프는 만들지 않는다.
 
 #### 네트워크 launch option
 
@@ -69,11 +71,14 @@ config에 두고, 전역 `run.sh`가 각 실행 패키지 config에 주입한다
 
 각 profile에는 `bridge_ip`와 `simulator_ip`를 둔다. same-PC 기본값은 양쪽 모두
 `127.0.0.1`이다. 두 PC를 유선 LAN으로 연결할 때 remote-PC의 `bridge_ip`에는 브릿지
-PC 유선 NIC 주소, `simulator_ip`에는 MORAI PC 유선 NIC 주소를 넣는다.
+PC 유선 NIC 주소, `simulator_ip`에는 MORAI PC 유선 NIC 주소를 넣는다. remote 실행 시
+연결된 물리 유선 NIC가 하나면 `launch.sh`가 이를 자동 탐색해 `bridge_ip/prefix_length`
+를 할당하고 simulator IP의 host route도 설정한다. 여러 유선 NIC가 연결된 경우에만
+remote profile의 선택적 `interface`에 NIC 이름을 명시한다.
 
 ```yaml
 network_launch:
-  launch_option: 1
+  launch_option: 2
   probe_port: 9303
   same_pc_probe_timeout_sec: 3.0
   wait_log_period_sec: 5.0
@@ -84,11 +89,14 @@ network_launch:
   remote_pc:
     bridge_ip: 192.168.10.2
     simulator_ip: 192.168.10.3
+    prefix_length: 24
 ```
 
 `launch.sh`는 다음 순서로 실행한다.
 
-1. 선택한 `bridge_ip`가 실제 local NIC에 할당됐는지 확인한다.
+1. remote profile이면 연결된 물리 유선 NIC를 찾아 활성화하고 `bridge_ip`와
+   simulator IP host route를 설정한 뒤 local bind로 확인한다. 이 단계의 `ip` 명령은
+   필요할 때 `sudo` 비밀번호를 요청한다.
 2. remote profile에서는 Ubuntu `ufw`가 활성화된 경우 camera/GPS/IMU/status RX
    UDP 포트를 `simulator_ip`에 한해서 연다. 비대화식 sudo 권한이 없으면 launch하지
    않고 필요한 port를 출력한다.
@@ -96,7 +104,8 @@ network_launch:
    도착하는지 확인한다. probe socket은 node 실행 전에 닫힌다.
 4. 성공한 profile을 원본 YAML에 덮어쓰지 않고 임시 YAML의 `bind_ip`,
    `allowed_source_ip`, control/lamp `destination_ip`에 주입한다.
-5. 임시 YAML로 `exec roslaunch`한다.
+5. 임시 YAML로 `roslaunch`와 packet-health helper를 백그라운드 실행한다.
+   `launch.sh`는 `roslaunch` 종료까지 기다리고 종료 signal 시 자식 프로세스를 정리한다.
 
 UDP에는 연결 handshake나 ACK가 없으므로 여기서 "연결 성공"은 지정한 MORAI IP에서
 실제 sensor datagram 하나를 받은 상태다. `launch.sh`는 MORAI GUI의 Network Settings를
@@ -147,8 +156,8 @@ respawn도 동작하지 않으므로 메인 `run.sh`는 `launch.sh` 프로세스
 - `SocketRecoveryPolicy`: `EAGAIN`, `EINTR`, 일시 오류와 지속·치명 오류를 구분하고 socket 재개방 여부만 결정한다.
 - `ControlTx`: 제어 토픽 callback과 50Hz 송신 timer를 조정한다. callback 안에 검증·보정 로직을 직접 쓰지 않는다.
 - `ControlCommandSanitizer`: TX 명령의 범위, brake 우선과 non-finite→0 대체를 한 번에 처리하고 변경 전후를 진단에 남긴다.
-- `CommandFreshnessGuard`: `command_timeout_sec`만 검사한다. fresh면 명령을 그대로 통과시키고 stale이면 설정된 `safe_brake_command`를 적용한다. 기어를 비롯한 주행 판단은 하지 않는다.
-- `MoraiControlEncoder`: 이미 선택된 제어값을 mode 1, gear D=4, velocity=0, acceleration=0 상수와 함께 55바이트 MORAI 패킷으로 직렬화할 뿐 검증·clamp·fallback을 하지 않는다.
+- `CommandFreshnessGuard`: `command_timeout_sec`만 검사한다. fresh면 명령을 그대로 통과시키고 stale이면 `safe_brake_command=1.0`인 풀브레이크를 적용한다. 기어를 비롯한 주행 판단은 하지 않는다.
+- `MoraiControlEncoder`: 이미 선택된 제어값을 `ctrl_mode=2(Auto)`, `longlCmdType=1(Throttle)`, gear D=4, velocity=0, acceleration=0 상수와 함께 55바이트 MORAI 패킷으로 직렬화할 뿐 검증·clamp·fallback을 하지 않는다.
 - `DiagnosticsReporter`: 채널별 최신 상태, 카운터, 주기와 lifetime을 갱신한다. 처리 결과 직후 같은 RX/TX 경로에서 queue 1의 `/diagnostics/high_hz`를 publish하고, 1Hz timer에서는 `/diagnostics` snapshot을 publish한다.
 
 ### 장애 격리
@@ -186,7 +195,7 @@ respawn도 동작하지 않으므로 메인 `run.sh`는 `launch.sh` 프로세스
 - stale RX 채널은 WARN/ERROR와 `/diagnostics/high_hz`로 알릴 뿐 마지막 센서값을 재발행하거나 값을 추정하지 않는다.
 - RX의 구조 검증은 header, byte length, tail/checksum처럼 필드 경계를 읽을 수 있는지만 판단한다. decode된 값은 0, 범위 밖, non-finite여도 바꾸거나 drop하지 않고 원본 발행과 WARN을 함께 수행한다.
 - 명세에 적힌 정확한 표현 변환(NMEA `ddmm.mmmm`→decimal degree)과 단위 변환 외에 좌표 변환, clamp, normalization, 보간, 추정을 하지 않는다.
-- TX 제어 입력은 `ControlCommandSanitizer`가 조향·페달 범위, brake 우선(`accel=0`), non-finite→0 대체를 한 분기에서 처리한 뒤에도 50Hz 송신을 계속한다. `longlCmdType`, velocity, acceleration 입력은 wire 출력에 사용하지 않으며 encoder가 항상 mode 1, velocity=0, acceleration=0을 쓴다. 변경 전후 값을 WARN 로그와 `/diagnostics/high_hz`에 남긴다.
+- TX 제어 입력은 `ControlCommandSanitizer`가 조향·페달 범위, brake 우선(`accel=0`), non-finite→0 대체를 한 분기에서 처리한 뒤에도 50Hz 송신을 계속한다. `longlCmdType`, velocity, acceleration 입력은 wire 출력에 사용하지 않으며 encoder가 항상 `ctrl_mode=2(Auto)`, `longlCmdType=1(Throttle)`, velocity=0, acceleration=0을 쓴다. 변경 전후 값을 WARN 로그와 `/diagnostics/high_hz`에 남긴다.
 - 제어 명령이 `command_timeout_sec`보다 오래되면 `CommandFreshnessGuard`가 설정된 safe brake를 선택한다. 진입과 복구를 WARN 로그와 `/diagnostics/high_hz`에 드러내며 기어는 변경하지 않는다.
 - `MoraiControlEncoder`는 선택된 명령의 직렬화만 하며 clamp, fallback, 주행 판단을 하지 않는다.
 - `/diagnostics`는 1Hz rich 전체 snapshot, `/diagnostics/high_hz`는 논리 sample·send 결과·상태 변화 직후 같은 처리 경로에서 발행하는 lean 단일 채널 상태다.
@@ -274,7 +283,7 @@ sequenceDiagram
         else camera channel batch
             loop every camera datagram in arrival order
                 Worker->>Parser: decodeStructure(datagram)
-                alt unreadable header/length/tail
+                alt unreadable header/length/size/tail
                     Parser-->>Worker: STRUCTURAL_ERROR
                     Worker->>Reporter: warn(STRUCTURAL_ERROR, raw metadata), drop datagram
                     Reporter->>HighHzTopic: publishHighHz(STRUCTURAL_ERROR, receipt_time)
@@ -414,7 +423,7 @@ sequenceDiagram
             Guard-->>Tx: configured safe_brake overlay
         end
         Tx->>Encoder: encodeMode1(selected, gear=4)
-        Encoder-->>Tx: 55-byte packet, mode=1, velocity=0, acceleration=0
+        Encoder-->>Tx: 55-byte packet, ctrl_mode=2, longlCmdType=1, velocity=0, acceleration=0
         Tx->>Sender: send(packet)
         alt send error
             Sender-->>Tx: error
@@ -474,7 +483,7 @@ sequenceDiagram
 | `ControlCommandSanitizer` | `sanitize(command)` | accel/brake/steering의 non-finite를 0으로 바꾸고, 범위를 clamp하며, 페달 충돌 시 brake를 남기고 accel=0으로 만든다. 변경 시 before/after를 WARN으로 남기며 송신을 중단하지 않는다. `longlCmdType`, velocity, acceleration은 다루지 않는다. |
 | `LatestCommand` | `store()`, `snapshot()` | sanitize된 최신 명령 하나와 monotonic receipt time만 보관한다. |
 | `CommandFreshnessGuard` | `select(latest, age)` | fresh 명령 또는 공개된 safe-brake overlay를 선택한다. wire gear에는 관여하지 않는다. |
-| `MoraiControlEncoder` | `encodeMode1(selected, gear=4)` | mode=1, gear=D(4), velocity=0, acceleration=0을 상수로 쓰고 선택된 accel/brake/steering을 55-byte packet으로 직렬화한다. 추가 fallback은 하지 않는다. |
+| `MoraiControlEncoder` | `encodeMode1(selected, gear=4)` | ctrl_mode=2(Auto), longlCmdType=1(Throttle), gear=D(4), velocity=0, acceleration=0을 상수로 쓰고 선택된 accel/brake/steering을 55-byte packet으로 직렬화한다. 추가 fallback은 하지 않는다. |
 | `LampCommandSanitizer` | `sanitize(lamps)` | 잘못된 `turnSignal` 또는 `emergencySignal` 필드만 `0=off`로 바꾸고 WARN을 남긴다. 잘못된 입력으로 비상등을 임의 점등하지 않는다. |
 | `MoraiLampEncoder` | `encode(lamps)` | sanitize된 값을 33-byte packet으로 직렬화한다. |
 | `TxSocketRecoveryPolicy` | `classify(errno, count)` | 일시·network 오류는 socket을 유지하고, socket-local fatal 오류나 설정된 연속 오류에서만 해당 sender를 reopen한다. control sender와 lamp sender 상태는 독립이다. |
@@ -631,17 +640,19 @@ MORAI timestamped layout은 아래와 같다. offset은 datagram 시작 기준�
 | 3 | 4 | uint32 | simulator `sec` |
 | 7 | 4 | uint32 | simulator raw `nsec` |
 | 11 | 4 | uint32 | chunk `index` |
-| 15 | 4 | uint32 | MORAI `size` |
-| 19 | 가변 | bytes | JPEG chunk payload |
+| 15 | 4 | uint32 | 이 chunk의 유효 JPEG payload byte 수 `size` |
+| 19 | `size` | bytes | JPEG chunk payload |
 | N-2 | 2 | ASCII | 중간 chunk `AI`, 마지막 chunk `EI` |
 
 구형 layout은 `sec/nsec`가 없으며 `index`가 offset 3, `size`가 offset 7,
 payload가 offset 11에서 시작한다. `config.yaml`의 `packet_layout`을
 `timestamped` 또는 `legacy`로 명시하며 packet 내용으로 layout을 자동 추측하지
-않는다. 선택된 layout에서 offset을 추측해 복구하지 않는다. `size`는 MORAI 버전에 따라 chunk 크기 또는 전체
-JPEG 크기로 해석되는 사례가 있으므로 JPEG bytes를 자르는 데 사용하지 않는다.
-실제 payload는 datagram의 header와 2B tail 사이 전체이며, `size` 불일치는 WARN과
-진단 raw 값으로만 남긴다.
+않는다. 선택된 layout에서 offset을 추측해 복구하지 않는다. 대회 버전
+`25.S4.MolitComp03`의 `size`는 해당 chunk에서 유효한 JPEG payload의 byte 수다.
+parser는 `[payload offset, payload offset + size)`만 assembler에 넘기며, 그 뒤부터
+datagram 끝의 2B tail 전까지 있는 고정 datagram padding은 버린다. `size=0` 또는
+`size`가 datagram의 payload 수용량보다 크면 유효 경계를 알 수 없는 구조 오류로
+해당 datagram을 버리고 진단에 기록한다.
 
 #### 재조립과 검증
 
@@ -650,15 +661,15 @@ JPEG 크기로 해석되는 사례가 있으므로 JPEG bytes를 자르는 데 �
 - chunk를 `index` map에 넣고 시작 index부터 `EI` index까지 모든 번호가 연속일
   때만 이어 붙인다. 순서가 바뀐 도착은 허용하지만 빠진 chunk는 추정하지 않는다.
 - 시작 chunk는 index 0, 또는 JPEG SOI `FF D8`로 시작하는 index 1만 허용한다.
-- header와 tail `AI/EI`는 구조 검증이다. `size=0`, `nsec>=1e9` 같은 값 이상은
+- header, tail `AI/EI`, `size` 경계는 구조 검증이다. `nsec>=1e9` 같은 값 이상은
   WARN만 남기고 chunk를 그대로 assembler에 전달한다.
 - 비정상 `index`로 무한 메모리를 쓰지 않도록 `max_chunks=256`과 최대 index를
   resource guard로 적용한다. 이 경우만 현재 frame을 명시적으로 drop하며 RX
   시퀀스의 `resource limit` 분기에 해당한다.
 - chunk 수가 `max_chunks=256`을 넘거나 새 frame이 시작되거나 조립 제한시간
   `0.2s`를 넘으면 현재 frame 전체를 버린다.
-- 조립 결과가 SOI `FF D8`로 시작하고 EOI `FF D9`를 포함해야 한다. 첫 EOI 뒤의
-  padding은 잘라내며, SOI/EOI가 없으면 발행하지 않는다.
+- 조립 결과가 SOI `FF D8`로 시작하고 EOI `FF D9`를 포함해야 한다. SOI/EOI가
+  없으면 발행하지 않는다.
 - 손실 frame은 `dropped_frames`, 구조 오류는 `invalid_frames`, packet 오류는
   `parse_error_count`에 각각 기록한다.
 
@@ -902,13 +913,14 @@ method로 둘지 value member 객체로 둘지는 구현 재량이지만, 시퀀
 - `accel=0.40, brake=0.20`이 동시에 오면 `accel=0.00, brake=0.20`을 보낸다.
 - `steering=1.20`이 오면 `1.00`으로 제한한다.
 - 입력 `longlCmdType`이 무엇이든 wire에는 `1`을 쓴다. 이는 이상값 fallback이 아니라
-  이 bridge의 고정된 mode 1 계약이다.
+  이 bridge의 고정된 `longlCmdType=1(Throttle)` 계약이다. 별도 wire 필드인
+  `ctrl_mode`는 `2(Auto)`로 고정하며 두 필드의 번호를 혼동하지 않는다.
 
 #### Freshness와 송신
 
 RX와 독립인 50Hz wall timer가 매 tick 최신 명령 snapshot을 읽는다. age가
 `command_timeout_sec=0.25` 미만이면 명령을 그대로 선택하고, 그 이상이면
-`accel=0`, `steer=0`, `brake=safe_brake_command` overlay를 선택한다. stale 진입과
+`accel=0`, `steer=0`, `brake=safe_brake_command=1.0`인 풀브레이크 overlay를 선택한다. stale 진입과
 복구를 진단에 드러내며 마지막 throttle을 계속 보내거나 송신 자체를 끊지 않는다.
 이는 **TX command stale 방어**다. RX sensor stale에서 이전 센서값을 재발행하지
 않는다는 합의와 다른 경로이며, RX는 계속 마지막 값을 재발행하지 않는다.
@@ -1024,4 +1036,4 @@ camera 성공은 chunk마다가 아니라 완성 frame마다 발행한다.
 - `DiagnosticsReporter`: 로그와 통계를 갱신하고, 처리 결과 직후 같은 callback/worker에서 lean `/diagnostics/high_hz`를 publish한다. 1Hz timer에서는 rich `/diagnostics` snapshot을 발행한다.
 - `CommandFreshnessGuard`: `select(latest, age)`가 age < `command_timeout_sec`이면 마지막 명령, 아니면 설정된 `safe_brake_command`를 고른다. fallback 진입·복구는 WARN 로그와 `/diagnostics/high_hz`로 노출하며 기어는 건드리지 않는다.
 - sanitize: normalized steering `[-1,1]`, pedal 범위와 충돌, non-finite를 한 번에 처리한다. non-finite는 0, 페달 동시면 brake를 남기고 accel=0으로 하며 UDP 송신은 끊지 않는다.
-- MoraiControlEncoder: 고른 명령을 mode 1, gear D=4, velocity=0, acceleration=0 상수와 함께 55바이트 Ego Ctrl Cmd 패킷으로 묶는 객체.
+- MoraiControlEncoder: 고른 명령을 ctrl_mode=2(Auto), longlCmdType=1(Throttle), gear D=4, velocity=0, acceleration=0 상수와 함께 55바이트 Ego Ctrl Cmd 패킷으로 묶는 객체.

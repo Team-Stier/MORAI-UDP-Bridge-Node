@@ -1,19 +1,16 @@
 # Package-local defaults. Workspace run.sh may overwrite vehicle_spec keys.
 network_launch:
-  # 1: same-PC first, then remote-PC. 2: remote-PC only.
-  launch_option: 1
-  probe_port: 9303
-  # Used only before option 1 falls back from same-PC to remote-PC.
-  same_pc_probe_timeout_sec: 3.0
-  wait_log_period_sec: 5.0
+  # 1: same-PC. 2: remote-PC.
+  launch_option: 2
   open_ufw_for_remote: true
   same_pc:
     bridge_ip: 127.0.0.1
-    simulator_ip: 127.0.0.1
+    simulator_ip: 192.168.0.8
   remote_pc:
     # Set these to the wired-LAN addresses before using option 2/fallback.
     bridge_ip: "192.168.0.20"
-    simulator_ip: "192.168.0.10"
+    simulator_ip: "192.168.0.8"
+    prefix_length: 24
 
 bind_ip: 0.0.0.0
 allowed_source_ip: ""
@@ -55,7 +52,7 @@ gps:
 
 imu:
   enabled: true
-  port: 9303
+  port: 999
   packet_layout: timestamped
   topic: /sensors/imu/data
   stale_timeout: 0.5
@@ -74,7 +71,7 @@ control:
   destination_port: 9093
   send_rate_hz: 50.0
   command_timeout_sec: 0.25
-  safe_brake_command: 0.50
+  safe_brake_command: 1.0
   send_error_reopen_threshold: 3
 
 lamp_control:

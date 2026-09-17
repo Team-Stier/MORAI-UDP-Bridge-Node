@@ -125,17 +125,17 @@ std::string checkedNmeaBody(const std::string& raw) {
 }
 
 double coordinate(const std::string& value, const std::string& direction,
-                  bool latitude) {
+                  bool latitude, bool* anomaly) {
   if (value.empty()) throw ProtocolError("GGA coordinate empty");
   if ((latitude && direction != "N" && direction != "S") ||
       (!latitude && direction != "E" && direction != "W"))
     throw ProtocolError("GGA coordinate direction malformed");
   const double raw = parseDouble(value, "coordinate");
-  const int degrees = static_cast<int>(std::floor(raw / 100.0));
+  const double degrees = std::floor(raw / 100.0);
   const double minutes = raw - degrees * 100.0;
   double result = degrees + minutes / 60.0;
-  if (raw < 0.0 || minutes >= 60.0 || result > (latitude ? 90.0 : 180.0))
-    throw ProtocolError("GGA coordinate out of range");
+  if (!std::isfinite(raw) || raw < 0.0 || minutes >= 60.0 ||
+      result > (latitude ? 90.0 : 180.0)) *anomaly = true;
   if (direction == "S" || direction == "W") result = -result;
   return result;
 }
@@ -173,13 +173,16 @@ CameraPacket decodeCameraPacket(const std::uint8_t* data, std::size_t size,
     packet.sec = readU32(data + 3U);
     packet.nsec = readU32(data + 7U);
     packet.index = readU32(data + 11U);
-    packet.declared_size = readU32(data + 15U);
+    packet.payload_size = readU32(data + 15U);
   } else {
     packet.index = readU32(data + 3U);
-    packet.declared_size = readU32(data + 7U);
+    packet.payload_size = readU32(data + 7U);
   }
+  const std::size_t payload_capacity = size - payload_offset - 2U;
+  if (packet.payload_size == 0U || packet.payload_size > payload_capacity)
+    throw ProtocolError("camera payload size malformed");
   packet.final = data[size - 2U] == 'E';
-  packet.payload.assign(data + payload_offset, data + size - 2U);
+  packet.payload.assign(data + payload_offset, data + payload_offset + packet.payload_size);
   return packet;
 }
 
@@ -198,17 +201,20 @@ void CameraFrameAssembler::reset() {
 }
 
 void CameraFrameAssembler::start(const CameraPacket& packet,
-                                 std::chrono::steady_clock::time_point receipt) {
+                                 std::chrono::steady_clock::time_point receipt,
+                                 std::uint64_t ros_receipt_ns) {
   active_ = true;
   has_key_ = packet.has_timestamp;
   key_sec_ = packet.sec;
   key_nsec_ = packet.nsec;
   first_receipt_ = receipt;
+  first_ros_receipt_ns_ = ros_receipt_ns;
 }
 
 bool CameraFrameAssembler::add(CameraPacket packet,
                                std::chrono::steady_clock::time_point receipt,
-                               CameraFrame* frame, std::string* drop_reason) {
+                               CameraFrame* frame, std::string* drop_reason,
+                               std::uint64_t ros_receipt_ns) {
   if (!frame || !drop_reason) throw std::invalid_argument("camera output is null");
   drop_reason->clear();
   if (active_ && receipt - first_receipt_ > timeout_) {
@@ -220,7 +226,7 @@ bool CameraFrameAssembler::add(CameraPacket packet,
     *drop_reason = "NEW_FRAME";
     reset();
   }
-  if (!active_) start(packet, receipt);
+  if (!active_) start(packet, receipt, ros_receipt_ns);
   if (packet.index >= max_chunks_) {
     *drop_reason = "MAX_CHUNKS";
     reset();
@@ -256,6 +262,7 @@ bool CameraFrameAssembler::add(CameraPacket packet,
   frame->source_sec = key_sec_;
   frame->source_nsec = key_nsec_;
   frame->first_receipt = first_receipt_;
+  frame->first_ros_receipt_ns = first_ros_receipt_ns_;
   reset();
   return true;
 }
@@ -280,11 +287,11 @@ GgaFix decodeGgaDatagram(const std::uint8_t* data, std::size_t size) {
       fix.quality = static_cast<int>(parseLong(fields[6], "quality"));
       fix.satellites = static_cast<int>(parseLong(fields[7], "satellites"));
       if (!fields[2].empty() || !fields[3].empty()) {
-        fix.latitude = coordinate(fields[2], fields[3], true);
+        fix.latitude = coordinate(fields[2], fields[3], true, &fix.coordinate_anomaly);
         fix.has_latitude = true;
       }
       if (!fields[4].empty() || !fields[5].empty()) {
-        fix.longitude = coordinate(fields[4], fields[5], false);
+        fix.longitude = coordinate(fields[4], fields[5], false, &fix.coordinate_anomaly);
         fix.has_longitude = true;
       }
       fix.has_hdop = optionalDouble(fields[8], "HDOP", &fix.hdop);

@@ -23,6 +23,14 @@
     .diagram { position: relative; }
     .hit-layer { position: absolute; inset: 0; pointer-events: none; z-index: 10; }
     .hit-target { position: absolute; min-width: 8px; min-height: 8px; pointer-events: auto; background: rgb(255 255 255 / 0.001); color: transparent; overflow: hidden; }
+    body.lidar-only > h2:nth-of-type(1),
+    body.lidar-only > .diagram:nth-of-type(1),
+    body.lidar-only > h3:nth-of-type(1),
+    body.lidar-only > table:nth-of-type(1),
+    body.lidar-only > h2:nth-of-type(3),
+    body.lidar-only > .diagram:nth-of-type(3),
+    body.lidar-only > h3:nth-of-type(3),
+    body.lidar-only > table:nth-of-type(3) { display: none; }
   </style>
 </head>
 <body>
@@ -186,6 +194,142 @@ sequenceDiagram
     </tbody>
   </table>
 
+  <h2>LiDAR RX (proposed)</h2>
+  <div class="diagram">
+    <pre class="mermaid">
+sequenceDiagram
+    participant Config as InjectedConfig
+    participant Validator as LidarConfigValidator
+    participant Worker as LidarRxWorker
+    participant Socket as UdpSocket (LiDAR port)
+    participant Decoder as VelodynePacketDecoder
+    participant Assembler as VelodyneScanAssembler
+    participant Translator as PointCloudTranslator
+    participant Freshness as ChannelFreshnessMonitor
+    participant Reporter as DiagnosticsReporter
+    participant Topic as /sensors/lidar/points
+    participant HighHz as /diagnostics/high_hz
+    participant Diag as /diagnostics
+
+    Note over Worker,Socket: one LiDAR worker thread and one socket<br/>independent of all camera/GPS/IMU/status RX and TX
+    Config->>Validator: validateLidarConfig(model, port, calibration, frame, rpm)
+    alt configuration unusable
+        Validator->>Reporter: error(LIDAR_CONFIG_ERROR, details)
+        Reporter->>HighHz: publishHighHz(LIDAR_CONFIG_ERROR, startup_time)
+        Validator-->>Worker: do not start LiDAR channel
+    else configuration usable
+        Validator-->>Worker: validated config
+        Worker->>Decoder: initialize(model, calibration)
+        Decoder-->>Worker: ready
+        Worker->>Assembler: initialize(upstream model/rpm scan policy)
+        Assembler-->>Worker: ready
+        Worker->>Worker: start()
+    end
+
+    loop LiDAR worker lifetime, independent of every other channel
+        Worker->>Socket: bind(local_ip, lidar_port)
+        alt bind failed
+            Socket-->>Worker: error
+            Worker->>Reporter: error(LIDAR_BIND_ERROR, details)
+            Reporter->>HighHz: publishHighHz(LIDAR_BIND_ERROR, now)
+            Worker->>Worker: boundedBackoff()
+        else bind succeeded
+            Socket-->>Worker: ready
+            Worker->>Reporter: reportRecovered(previous=LIDAR_BIND_ERROR)
+            Reporter->>HighHz: publishHighHz(OK, recovered_from=LIDAR_BIND_ERROR, now)
+
+            loop drain kernel receive buffer in arrival order
+                Worker->>Socket: recvfrom()
+                alt datagram received
+                    Socket-->>Worker: datagram, sender, receipt_time
+                    alt allowed_source_ip configured and sender differs
+                        Worker->>Reporter: warn(SOURCE_REJECTED, sender), drop datagram
+                        Reporter->>HighHz: publishHighHz(SOURCE_REJECTED, receipt_time)
+                    else sender accepted
+                        Worker->>Decoder: decodePacket(datagram)
+                        alt Velodyne packet structure invalid
+                            Decoder-->>Worker: STRUCTURAL_ERROR
+                            Worker->>Reporter: warn(LIDAR_PARSE_ERROR, metadata), drop datagram
+                            Reporter->>HighHz: publishHighHz(LIDAR_PARSE_ERROR, receipt_time)
+                        else decoded packet
+                            Decoder-->>Worker: firing blocks, azimuth
+                            Worker->>Assembler: appendPacket(decoded, receipt_time)
+                            alt upstream scan boundary not reached
+                                Assembler-->>Worker: incomplete
+                                Worker->>Reporter: recordPacketAccepted()
+                                Reporter->>HighHz: publishHighHz(PACKET_ACCEPTED, receipt_time)
+                            else upstream scan boundary reached
+                                Assembler-->>Worker: completed scan, last receipt_time
+                                Worker->>Translator: translateToPointCloud2(scan)
+                                alt translation succeeded
+                                    Translator-->>Worker: PointCloud2
+                                    Worker->>Topic: publish(msg, stamp=last receipt_time)
+                                    Worker->>Freshness: recordLogicalPublish(receipt_time)
+                                    Worker->>Reporter: recordPublished(lifetime)
+                                    Reporter->>HighHz: publishHighHz(PUBLISHED, receipt_time)
+                                else translation exception except bad_alloc
+                                    Translator-->>Worker: error
+                                    Worker->>Assembler: resetIncompleteScan()
+                                    Worker->>Reporter: error(LIDAR_TRANSLATION_ERROR, details)
+                                    Reporter->>HighHz: publishHighHz(LIDAR_TRANSLATION_ERROR, receipt_time)
+                                end
+                            end
+                        end
+                    end
+                else EAGAIN
+                    Socket-->>Worker: queue empty, normal drain end
+                else EINTR
+                    Socket-->>Worker: interrupted
+                    Worker->>Socket: retry recvfrom()
+                else transient recv error below threshold
+                    Socket-->>Worker: error
+                    Worker->>Reporter: warn(LIDAR_RECV_ERROR, count), keep socket
+                    Reporter->>HighHz: publishHighHz(LIDAR_RECV_ERROR, now)
+                else fatal descriptor error or reopen threshold reached
+                    Socket-->>Worker: fatal or repeated error
+                    Worker->>Reporter: error(LIDAR_SOCKET_REOPEN, details)
+                    Reporter->>HighHz: publishHighHz(LIDAR_SOCKET_REOPEN, now)
+                    Worker->>Assembler: resetIncompleteScan()
+                    Worker->>Socket: close()
+                    Worker->>Worker: break to bind loop
+                end
+            end
+        end
+    end
+
+    loop independent stale check
+        Freshness->>Freshness: check(now - last logical publish)
+        alt stale timeout newly exceeded
+            Freshness->>Reporter: warn(LIDAR_STALE), no point-cloud republish
+            Reporter->>HighHz: publishHighHz(LIDAR_STALE, now)
+        else recovered by a new logical publish
+            Freshness->>Reporter: recover(LIDAR_STALE)
+            Reporter->>HighHz: publishHighHz(OK_RECOVERY, receipt_time)
+        else state unchanged
+            Freshness->>Freshness: no notification
+        end
+    end
+
+    loop every 1 second
+        Reporter->>Reporter: snapshotAllChannels()
+        Reporter->>Diag: publishRichDiagnostics(snapshot)
+    end
+    </pre>
+  </div>
+
+  <h3>LiDAR 객체와 메서드 (proposed)</h3>
+  <table>
+    <thead><tr><th>객체</th><th>주요 메서드</th><th>책임과 구현 주의사항</th></tr></thead>
+    <tbody>
+      <tr><td><code>LidarRxWorker</code></td><td><code>run()</code>, <code>drainSocket()</code></td><td>LiDAR 전용 thread와 socket을 소유한다. kernel queue를 EAGAIN까지 도착 순서대로 읽으며 애플리케이션 packet queue는 만들지 않는다.</td></tr>
+      <tr><td><code>VelodynePacketDecoder</code></td><td><code>initialize()</code>, <code>decodePacket()</code></td><td>workspace의 Velodyne 라이브러리와 calibration을 사용한다. 구조가 깨진 datagram만 거부하고 측정값은 보정하지 않는다.</td></tr>
+      <tr><td><code>VelodyneScanAssembler</code></td><td><code>initialize()</code>, <code>appendPacket()</code>, <code>resetIncompleteScan()</code></td><td>선택한 model/RPM에 대응하는 upstream Velodyne scan 경계 규칙을 그대로 사용한다. 별도 순서 역전, 중복, 최소 point 수 정책은 추가하지 않는다.</td></tr>
+      <tr><td><code>PointCloudTranslator</code></td><td><code>translateToPointCloud2()</code></td><td>upstream calibration 결과를 <code>sensor_msgs/PointCloud2</code>로 만든다. stamp는 완성 scan의 마지막 packet receipt time이며 frame은 config 값을 쓴다.</td></tr>
+      <tr><td><code>ChannelFreshnessMonitor</code></td><td><code>recordLogicalPublish()</code>, <code>check()</code></td><td>완성 PointCloud2 발행을 logical publish로 센다. stale 상태에서도 과거 cloud를 재발행하지 않는다.</td></tr>
+      <tr><td><code>DiagnosticsReporter</code></td><td><code>recordPacketAccepted()</code>, <code>recordPublished()</code></td><td>packet 처리 결과를 <code>/diagnostics/high_hz</code>로 즉시 알리고 1초 snapshot에는 packet/scan rate, tail latency, 오류 counter를 제공한다.</td></tr>
+    </tbody>
+  </table>
+
   <h2>TX</h2>
   <div class="diagram">
     <pre class="mermaid">
@@ -242,7 +386,7 @@ sequenceDiagram
             Guard-->>Tx: configured safe_brake overlay
         end
         Tx->>Encoder: encodeMode1(selected, gear=4)
-        Encoder-->>Tx: 55-byte packet, mode=1, velocity=0, acceleration=0
+        Encoder-->>Tx: 55-byte packet, ctrl_mode=2, longlCmdType=1, velocity=0, acceleration=0
         Tx->>Sender: send(packet)
         alt send error
             Sender-->>Tx: error
@@ -304,7 +448,7 @@ sequenceDiagram
       <tr><td><code>ControlCommandSanitizer</code></td><td><code>sanitize()</code></td><td>accel/brake/steering의 non-finite를 0으로 바꾸고 범위를 clamp하며 페달 충돌에는 brake를 우선한다.</td></tr>
       <tr><td><code>LatestCommand</code></td><td><code>store()</code>, <code>snapshot()</code></td><td>sanitize된 최신 명령 하나와 monotonic receipt time만 보관한다.</td></tr>
       <tr><td><code>CommandFreshnessGuard</code></td><td><code>select()</code></td><td>fresh 명령 또는 공개된 safe-brake overlay를 선택한다.</td></tr>
-      <tr><td><code>MoraiControlEncoder</code></td><td><code>encodeMode1()</code></td><td>mode=1, gear=D(4), velocity=0, acceleration=0 상수와 선택된 accel/brake/steering을 55-byte packet으로 직렬화한다.</td></tr>
+      <tr><td><code>MoraiControlEncoder</code></td><td><code>encodeMode1()</code></td><td>ctrl_mode=2(Auto), longlCmdType=1(Throttle), gear=D(4), velocity=0, acceleration=0 상수와 선택된 accel/brake/steering을 55-byte packet으로 직렬화한다.</td></tr>
       <tr><td><code>LampCommandSanitizer</code></td><td><code>sanitize()</code></td><td>잘못된 lamp 필드만 0=off로 바꾸며 비상등을 임의 점등하지 않는다.</td></tr>
       <tr><td><code>MoraiLampEncoder</code></td><td><code>encode()</code></td><td>sanitize된 값을 33-byte packet으로 직렬화한다.</td></tr>
       <tr><td><code>TxSocketRecoveryPolicy</code></td><td><code>classify()</code></td><td>일시·network 오류는 socket을 유지하고 socket-local fatal/연속 오류에서만 해당 sender를 reopen한다.</td></tr>
@@ -314,6 +458,7 @@ sequenceDiagram
 
   <script type="module">
     import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    if (new URLSearchParams(location.search).get("view") === "lidar") document.body.classList.add("lidar-only");
     mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose", sequence: { useMaxWidth: true, wrap: true, diagramMarginX: 24 } });
 
     function installHitTargets(diagram) {

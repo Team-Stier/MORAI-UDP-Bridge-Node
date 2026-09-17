@@ -36,6 +36,11 @@ install(PROGRAMS launch.sh scripts/network_launch.py scripts/monitor_packet_heal
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 
 if(CATKIN_ENABLE_TESTING)
+  catkin_add_gtest(test_runtime test/test_runtime.cpp)
+  if(TARGET test_runtime)
+    target_compile_features(test_runtime PUBLIC cxx_std_14)
+    target_link_libraries(test_runtime morai_udp_bridge_runtime gtest_main)
+  endif()
   catkin_add_gtest(test_protocol test/test_protocol.cpp)
   if(TARGET test_protocol)
     target_compile_features(test_protocol PUBLIC cxx_std_14)

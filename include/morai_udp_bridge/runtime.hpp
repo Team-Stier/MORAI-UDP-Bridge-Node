@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
@@ -29,6 +30,41 @@ struct Datagram {
   SteadyClock::time_point steady_receipt;
 };
 
+struct UdpSourceFilter {
+  static bool accept(const std::string& sender, const std::string& allowed) {
+    return allowed.empty() || sender == allowed;
+  }
+};
+
+struct ChannelFreshnessMonitor {
+  static double age(bool has_publish, SteadyClock::time_point last_publish,
+                    SteadyClock::time_point now);
+  static bool check(double age_seconds, double timeout);
+};
+
+struct LatestDatagramSelector {
+  template <typename Sample, typename Parser>
+  static bool selectNewestDecodable(const std::vector<Datagram>& batch,
+                                    Parser parser, Sample* sample,
+                                    std::size_t* selected,
+                                    std::size_t* rejected, std::size_t* non_target) {
+    *rejected = 0;
+    *non_target = 0;
+    for (std::size_t i = batch.size(); i > 0; --i) {
+      try {
+        *sample = parser(batch[i - 1]);
+        *selected = i - 1;
+        return true;
+      } catch (const NonTargetPacket&) {
+        ++*non_target;
+      } catch (const ProtocolError&) {
+        ++*rejected;
+      }
+    }
+    return false;
+  }
+};
+
 struct ChannelSnapshot {
   std::string name;
   std::string direction;
@@ -39,10 +75,18 @@ struct ChannelSnapshot {
   std::string error_code{"WAITING"};
   ros::Time state_since;
   ros::Time last_error_time;
+  ros::Time last_transition_time;
   ros::Time receipt_time;
   bool has_logical_publish{false};
   SteadyClock::time_point last_logical_publish;
   double stale_timeout{0.0};
+  bool disabled{false};
+  bool stale_command{false};
+  bool stale_sensor{false};
+  bool sanitized_command{false};
+  std::string anomaly;
+  bool has_command{false};
+  SteadyClock::time_point last_command;
   std::uint64_t received{0};
   std::uint64_t published{0};
   std::uint64_t rejected_source{0};
@@ -53,6 +97,10 @@ struct ChannelSnapshot {
   std::uint64_t send_error{0};
   std::uint64_t sanitized{0};
   std::uint64_t stale_fallback{0};
+  std::uint64_t chunks{0};
+  std::uint64_t completed_frames{0};
+  std::uint64_t dropped_frames{0};
+  std::uint64_t invalid_frames{0};
   double source_sec{0.0};
   double source_nsec{0.0};
   std::size_t requested_buffer{0};
@@ -77,6 +125,7 @@ class DiagnosticsReporter {
                   const ros::Time& stamp);
   void valueAnomaly(const std::string& name, const std::string& detail,
                     const ros::Time& stamp);
+  void recordChunk(const std::string& name);
   void configError(const std::string& name, const std::string& detail);
   void socketError(const std::string& name, const std::string& code,
                    const std::string& detail, const ros::Time& stamp);
@@ -88,13 +137,16 @@ class DiagnosticsReporter {
   void published(const std::string& name, const ros::Time& stamp,
                  SteadyClock::time_point receipt, double source_sec = 0.0,
                  double source_nsec = 0.0);
-  void commandAccepted(bool sanitized, const ros::Time& stamp);
+  void commandAccepted(bool sanitized, const ros::Time& stamp,
+                       SteadyClock::time_point receipt,
+                       const std::string& before, const std::string& after,
+                       const std::string& name = "control_tx");
   void sent(const std::string& name, const ros::Time& stamp,
             SteadyClock::time_point started);
   void sendError(const std::string& name, const std::string& detail,
                  const ros::Time& stamp);
   void staleFallback(const std::string& name, double age,
-                     const ros::Time& stamp);
+                     const ros::Time& stamp, bool stale = true);
   void recovered(const std::string& name, const std::string& code,
                  const ros::Time& stamp);
   void workerException(const std::string& name, const std::string& detail,
@@ -104,6 +156,9 @@ class DiagnosticsReporter {
   void checkStale();
 
  private:
+  void transition(ChannelSnapshot& item, int level, const std::string& code,
+                  const std::string& message, const ros::Time& stamp);
+  void recordLifetime(ChannelSnapshot& item, SteadyClock::time_point started);
   void publishHighHzLocked(ChannelSnapshot& channel, const ros::Time& stamp);
   diagnostic_msgs::DiagnosticStatus statusLocked(const ChannelSnapshot& channel,
                                                   bool rich) const;
@@ -128,6 +183,14 @@ class SocketRecoveryPolicy {
   unsigned int threshold_;
 };
 
+class TxSocketRecoveryPolicy {
+ public:
+  explicit TxSocketRecoveryPolicy(unsigned int threshold) : threshold_(threshold) {}
+  SocketAction classify(int error, unsigned int consecutive_errors) const;
+ private:
+  unsigned int threshold_;
+};
+
 class UdpRxWorker {
  public:
   using BatchHandler = std::function<void(std::vector<Datagram>)>;
@@ -144,6 +207,7 @@ class UdpRxWorker {
   int bindSocket();
   void closeSocket();
   void resetRuntimeState();
+  bool drainBatch(std::array<std::uint8_t, 65535U>& buffer);
   void run();
 
   std::string name_;
@@ -159,20 +223,22 @@ class UdpRxWorker {
   int socket_{-1};
   std::thread thread_;
   std::vector<Datagram> batch_;
+  unsigned int consecutive_errors_{0};
 };
 
 class UdpSender {
  public:
-  UdpSender(std::string ip, std::uint16_t port, unsigned int reopen_threshold);
+  UdpSender(std::string ip, std::uint16_t port);
   ~UdpSender();
   bool send(const std::vector<std::uint8_t>& packet, int* error);
+  bool reopen();
+  unsigned int consecutiveErrors() const { return consecutive_errors_; }
 
  private:
   bool open();
   void close();
   std::string ip_;
   std::uint16_t port_;
-  unsigned int threshold_;
   unsigned int consecutive_errors_{0};
   int socket_{-1};
   std::vector<std::uint8_t> address_;

@@ -27,13 +27,18 @@ class HealthMonitor:
             if channel not in self.expected:
                 continue
             values = {item.key: item.value for item in status.values}
-            healthy = status.level == 0 and values.get("error_code") in {
-                "PUBLISHED", "SENT"
-            }
+            error_code = values.get("error_code")
+            healthy = (
+                status.level == 0 and error_code in {"PUBLISHED", "SENT"}
+            ) or (
+                channel == "control_tx" and error_code == "STALE_COMMAND"
+            )
             if self.states.get(channel) == healthy:
                 continue
             self.states[channel] = healthy
             state = "GREEN" if healthy else "RED"
+            if sys.stdout.isatty():
+                state = f"\033[{'32' if healthy else '31'}m{state}\033[0m"
             print(
                 f"[morai_udp_bridge] {state} {channel}: "
                 f"{status.message} received={values.get('received', '0')} "
@@ -43,8 +48,6 @@ class HealthMonitor:
                 f"send_error={values.get('send_error', '0')}",
                 flush=True,
             )
-        if self.expected <= self.states.keys():
-            rospy.signal_shutdown("all packet channel states logged")
 
 
 def main():

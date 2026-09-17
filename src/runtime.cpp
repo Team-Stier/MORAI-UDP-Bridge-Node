@@ -52,6 +52,17 @@ bool fatalSocketError(int error) {
 
 }  // namespace
 
+double ChannelFreshnessMonitor::age(bool has_publish,
+                                    SteadyClock::time_point last_publish,
+                                    SteadyClock::time_point now) {
+  return has_publish ? std::chrono::duration<double>(now - last_publish).count()
+                     : std::numeric_limits<double>::infinity();
+}
+
+bool ChannelFreshnessMonitor::check(double age_seconds, double timeout) {
+  return timeout > 0.0 && age_seconds >= timeout;
+}
+
 DiagnosticsReporter::DiagnosticsReporter(ros::NodeHandle node,
                                          const std::string& rich_topic,
                                          const std::string& high_hz_topic,
@@ -75,6 +86,7 @@ void DiagnosticsReporter::addChannel(const std::string& name,
   item.topic = topic;
   item.stale_timeout = stale_timeout;
   item.state_since = ros::Time::now();
+  item.last_transition_time = item.state_since;
   channels_[name] = item;
 }
 
@@ -82,6 +94,29 @@ ChannelSnapshot& DiagnosticsReporter::channel(const std::string& name) {
   const auto found = channels_.find(name);
   if (found == channels_.end()) throw std::logic_error("unknown diagnostic channel: " + name);
   return found->second;
+}
+
+void DiagnosticsReporter::transition(ChannelSnapshot& item, int level,
+                                      const std::string& code,
+                                      const std::string& message,
+                                      const ros::Time& stamp) {
+  if (item.level != level || item.error_code != code) {
+    item.state_since = stamp;
+    item.last_transition_time = stamp;
+  }
+  item.level = level;
+  item.error_code = code;
+  item.message = message;
+  if (level != diagnostic_msgs::DiagnosticStatus::OK) item.last_error_time = stamp;
+}
+
+void DiagnosticsReporter::recordLifetime(ChannelSnapshot& item,
+                                          SteadyClock::time_point started) {
+  const auto now = SteadyClock::now();
+  item.event_times.push_back(now);
+  item.lifetimes_ms.push_back(std::chrono::duration<double, std::milli>(now - started).count());
+  if (item.event_times.size() > 512U) item.event_times.erase(item.event_times.begin());
+  if (item.lifetimes_ms.size() > 512U) item.lifetimes_ms.erase(item.lifetimes_ms.begin());
 }
 
 void DiagnosticsReporter::setSocketBuffer(const std::string& name,
@@ -104,10 +139,8 @@ void DiagnosticsReporter::rejected(const std::string& name, const Datagram& data
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
   ++item.rejected_source;
-  item.level = diagnostic_msgs::DiagnosticStatus::WARN;
-  item.message = "source rejected";
-  item.error_code = "SOURCE_REJECTED";
-  item.last_error_time = datagram.ros_receipt;
+  transition(item, diagnostic_msgs::DiagnosticStatus::WARN, "SOURCE_REJECTED",
+             "source rejected", datagram.ros_receipt);
   publishHighHzLocked(item, datagram.ros_receipt);
 }
 
@@ -117,10 +150,8 @@ void DiagnosticsReporter::parseError(const std::string& name,
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
   ++item.parse_error;
-  item.level = diagnostic_msgs::DiagnosticStatus::WARN;
-  item.message = detail;
-  item.error_code = "STRUCTURAL_ERROR";
-  item.last_error_time = stamp;
+  transition(item, diagnostic_msgs::DiagnosticStatus::WARN, "STRUCTURAL_ERROR", detail, stamp);
+  ROS_WARN_STREAM_THROTTLE(1.0, name << ": STRUCTURAL_ERROR: " << detail);
   publishHighHzLocked(item, stamp);
 }
 
@@ -129,21 +160,25 @@ void DiagnosticsReporter::valueAnomaly(const std::string& name,
                                        const ros::Time& stamp) {
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
-  item.level = diagnostic_msgs::DiagnosticStatus::WARN;
-  item.message = detail;
-  item.error_code = "VALUE_ANOMALY";
-  item.last_error_time = stamp;
+  item.anomaly = detail;
+  if (detail.empty()) return;
+  transition(item, diagnostic_msgs::DiagnosticStatus::WARN, "VALUE_ANOMALY", detail, stamp);
+  ROS_WARN_STREAM_THROTTLE(1.0, name << ": VALUE_ANOMALY: " << detail);
   publishHighHzLocked(item, stamp);
+}
+
+void DiagnosticsReporter::recordChunk(const std::string& name) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ++channel(name).chunks;
 }
 
 void DiagnosticsReporter::configError(const std::string& name,
                                       const std::string& detail) {
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
-  item.level = diagnostic_msgs::DiagnosticStatus::ERROR;
-  item.message = detail;
-  item.error_code = "CONFIG_ERROR";
-  item.last_error_time = ros::Time::now();
+  item.disabled = true;
+  transition(item, diagnostic_msgs::DiagnosticStatus::ERROR, "CONFIG_ERROR", detail, ros::Time::now());
+  ROS_ERROR_STREAM(name << ": CONFIG_ERROR: " << detail);
   publishHighHzLocked(item, item.last_error_time);
 }
 
@@ -153,11 +188,10 @@ void DiagnosticsReporter::socketError(const std::string& name,
                                       const ros::Time& stamp) {
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
-  item.level = code == "SOCKET_REOPEN" ? diagnostic_msgs::DiagnosticStatus::ERROR
-                                        : diagnostic_msgs::DiagnosticStatus::WARN;
-  item.message = detail;
-  item.error_code = code;
-  item.last_error_time = stamp;
+  transition(item, code == "SOCKET_REOPEN" ? diagnostic_msgs::DiagnosticStatus::ERROR
+                                            : diagnostic_msgs::DiagnosticStatus::WARN,
+             code, detail, stamp);
+  ROS_WARN_STREAM_THROTTLE(1.0, name << ": " << code << ": " << detail);
   publishHighHzLocked(item, stamp);
 }
 
@@ -168,8 +202,7 @@ void DiagnosticsReporter::ignored(const std::string& name, const std::string& co
   const auto found = item.extra.find("non_gga");
   const std::uint64_t count = found == item.extra.end() ? 0U : std::stoull(found->second);
   item.extra["non_gga"] = text(count + 1U);
-  item.error_code = code;
-  item.message = "normal non-target packet";
+  transition(item, item.level, code, "normal non-target packet", stamp);
   publishHighHzLocked(item, stamp);
 }
 
@@ -184,10 +217,10 @@ void DiagnosticsReporter::dropped(const std::string& name,
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
   ++item.dropped;
-  item.level = diagnostic_msgs::DiagnosticStatus::WARN;
-  item.message = reason;
-  item.error_code = "FRAME_DROPPED";
-  item.last_error_time = stamp;
+  ++item.dropped_frames;
+  if (reason == "JPEG_STRUCTURE") ++item.invalid_frames;
+  transition(item, diagnostic_msgs::DiagnosticStatus::WARN, "FRAME_DROPPED", reason, stamp);
+  ROS_WARN_STREAM_THROTTLE(1.0, name << ": FRAME_DROPPED: " << reason);
   publishHighHzLocked(item, stamp);
 }
 
@@ -199,35 +232,50 @@ void DiagnosticsReporter::published(const std::string& name,
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
   ++item.published;
-  item.has_logical_publish = true;
-  item.last_logical_publish = SteadyClock::now();
-  item.event_times.push_back(item.last_logical_publish);
-  item.lifetimes_ms.push_back(
-      std::chrono::duration<double, std::milli>(SteadyClock::now() - receipt).count());
-  if (item.event_times.size() > 512U) item.event_times.erase(item.event_times.begin());
-  if (item.lifetimes_ms.size() > 512U) item.lifetimes_ms.erase(item.lifetimes_ms.begin());
-  item.level = diagnostic_msgs::DiagnosticStatus::OK;
-  item.message = "published";
-  item.error_code = "PUBLISHED";
+  if (name.compare(0, 7, "camera_") == 0) ++item.completed_frames;
+  const bool recovering = item.stale_sensor;
+  item.stale_sensor = false;
   item.receipt_time = stamp;
   item.source_sec = source_sec;
   item.source_nsec = source_nsec;
+  item.has_logical_publish = true;
+  item.last_logical_publish = SteadyClock::now();
+  recordLifetime(item, receipt);
+  if (recovering) {
+    transition(item, diagnostic_msgs::DiagnosticStatus::OK, "OK_RECOVERY", "new sensor sample", stamp);
+    publishHighHzLocked(item, stamp);
+  }
+  transition(item, item.anomaly.empty() ? diagnostic_msgs::DiagnosticStatus::OK
+                                       : diagnostic_msgs::DiagnosticStatus::WARN,
+             item.anomaly.empty() ? "PUBLISHED" : "VALUE_ANOMALY",
+             item.anomaly.empty() ? "published" : item.anomaly, stamp);
   publishHighHzLocked(item, stamp);
 }
 
-void DiagnosticsReporter::commandAccepted(bool sanitized, const ros::Time& stamp) {
+void DiagnosticsReporter::commandAccepted(bool sanitized, const ros::Time& stamp,
+                                           SteadyClock::time_point receipt,
+                                           const std::string& before,
+                                           const std::string& after,
+                                           const std::string& name) {
   std::lock_guard<std::mutex> lock(mutex_);
-  ChannelSnapshot& item = channel("control_tx");
+  ChannelSnapshot& item = channel(name);
+  const bool was_sanitized = item.sanitized_command;
+  item.sanitized_command = sanitized;
+  item.has_command = true;
+  item.last_command = receipt;
+  item.receipt_time = stamp;
+  item.extra["before"] = before;
+  item.extra["after"] = after;
   if (sanitized) {
     ++item.sanitized;
-    item.level = diagnostic_msgs::DiagnosticStatus::WARN;
-    item.message = "command sanitized";
-    item.error_code = "SANITIZED_COMMAND";
-    item.last_error_time = stamp;
+    const std::string code = name == "lamp_tx" ? "LAMP_VALUE_ANOMALY" : "SANITIZED_COMMAND";
+    transition(item, diagnostic_msgs::DiagnosticStatus::WARN, code,
+               "before=" + before + " after=" + after, stamp);
+    ROS_WARN_STREAM_THROTTLE(1.0, name << ": " << code << " before=" << before << " after=" << after);
   } else {
-    item.level = diagnostic_msgs::DiagnosticStatus::OK;
-    item.message = "command accepted";
-    item.error_code = "COMMAND_ACCEPTED";
+    transition(item, diagnostic_msgs::DiagnosticStatus::OK,
+               was_sanitized ? "SANITIZED_COMMAND_RECOVERED" : "COMMAND_ACCEPTED",
+               "command accepted", stamp);
   }
   publishHighHzLocked(item, stamp);
 }
@@ -237,12 +285,17 @@ void DiagnosticsReporter::sent(const std::string& name, const ros::Time& stamp,
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
   ++item.sent;
-  item.event_times.push_back(SteadyClock::now());
-  item.lifetimes_ms.push_back(
-      std::chrono::duration<double, std::milli>(SteadyClock::now() - started).count());
-  item.level = diagnostic_msgs::DiagnosticStatus::OK;
-  item.message = "sent";
-  item.error_code = "SENT";
+  recordLifetime(item, started);
+  if (item.stale_command) {
+    transition(item, diagnostic_msgs::DiagnosticStatus::WARN, "STALE_COMMAND",
+               "stale command, safe brake selected", stamp);
+  } else if (item.sanitized_command) {
+    transition(item, diagnostic_msgs::DiagnosticStatus::WARN,
+               name == "lamp_tx" ? "LAMP_VALUE_ANOMALY" : "SANITIZED_COMMAND",
+               "before=" + item.extra["before"] + " after=" + item.extra["after"], stamp);
+  } else {
+    transition(item, diagnostic_msgs::DiagnosticStatus::OK, "SENT", "sent", stamp);
+  }
   publishHighHzLocked(item, stamp);
 }
 
@@ -252,23 +305,24 @@ void DiagnosticsReporter::sendError(const std::string& name,
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
   ++item.send_error;
-  item.level = diagnostic_msgs::DiagnosticStatus::ERROR;
-  item.message = detail;
-  item.error_code = "TX_SEND_ERROR";
-  item.last_error_time = stamp;
+  transition(item, diagnostic_msgs::DiagnosticStatus::ERROR,
+             name == "lamp_tx" ? "LAMP_TX_SEND_ERROR" : "TX_SEND_ERROR", detail, stamp);
+  ROS_WARN_STREAM_THROTTLE(1.0, name << ": send error: " << detail);
   publishHighHzLocked(item, stamp);
 }
 
 void DiagnosticsReporter::staleFallback(const std::string& name, double age,
-                                        const ros::Time& stamp) {
+                                        const ros::Time& stamp, bool stale) {
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
-  ++item.stale_fallback;
-  item.level = diagnostic_msgs::DiagnosticStatus::WARN;
-  item.message = "stale command, safe brake selected";
-  item.error_code = "STALE_COMMAND";
-  item.extra["command_age_ms"] = decimal(age * 1000.0);
-  item.last_error_time = stamp;
+  const bool changed = item.stale_command != stale;
+  item.stale_command = stale;
+  if (stale) ++item.stale_fallback;
+  if (!changed) return;
+  transition(item, stale ? diagnostic_msgs::DiagnosticStatus::WARN : diagnostic_msgs::DiagnosticStatus::OK,
+             stale ? "STALE_COMMAND" : "STALE_COMMAND_RECOVERED",
+             stale ? "stale command, safe brake selected" : "fresh command restored", stamp);
+  ROS_WARN_STREAM(name << ": " << item.error_code << " age=" << age);
   publishHighHzLocked(item, stamp);
 }
 
@@ -278,10 +332,7 @@ void DiagnosticsReporter::recovered(const std::string& name,
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
   if (item.level == diagnostic_msgs::DiagnosticStatus::OK) return;
-  item.level = diagnostic_msgs::DiagnosticStatus::OK;
-  item.message = "recovered";
-  item.error_code = code;
-  item.state_since = stamp;
+  transition(item, diagnostic_msgs::DiagnosticStatus::OK, code, "recovered", stamp);
   publishHighHzLocked(item, stamp);
 }
 
@@ -290,10 +341,7 @@ void DiagnosticsReporter::workerException(const std::string& name,
                                           const ros::Time& stamp) {
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
-  item.level = diagnostic_msgs::DiagnosticStatus::ERROR;
-  item.message = detail;
-  item.error_code = "WORKER_EXCEPTION";
-  item.last_error_time = stamp;
+  transition(item, diagnostic_msgs::DiagnosticStatus::ERROR, "WORKER_EXCEPTION", detail, stamp);
   publishHighHzLocked(item, stamp);
 }
 
@@ -310,16 +358,11 @@ void DiagnosticsReporter::checkStale() {
   std::lock_guard<std::mutex> lock(mutex_);
   for (auto& entry : channels_) {
     ChannelSnapshot& item = entry.second;
-    if (item.direction != "rx" || item.stale_timeout <= 0.0) continue;
-    const double age = item.has_logical_publish
-                           ? std::chrono::duration<double>(now - item.last_logical_publish).count()
-                           : std::numeric_limits<double>::infinity();
-    if (age > item.stale_timeout && item.error_code != "STALE") {
-      item.level = diagnostic_msgs::DiagnosticStatus::WARN;
-      item.message = "channel stale; no republish";
-      item.error_code = "STALE";
-      item.last_error_time = stamp;
-      item.extra["stale_age_ms"] = std::isfinite(age) ? decimal(age * 1000.0) : "inf";
+    if (item.direction != "rx" || item.disabled) continue;
+    const double age = ChannelFreshnessMonitor::age(item.has_logical_publish, item.last_logical_publish, now);
+    if (ChannelFreshnessMonitor::check(age, item.stale_timeout) && !item.stale_sensor) {
+      item.stale_sensor = true;
+      transition(item, diagnostic_msgs::DiagnosticStatus::WARN, "STALE", "channel stale; no republish", stamp);
       publishHighHzLocked(item, stamp);
     }
   }
@@ -338,14 +381,33 @@ diagnostic_msgs::DiagnosticStatus DiagnosticsReporter::statusLocked(
   status.values.push_back(value("topic", item.topic));
   status.values.push_back(value("error_code", item.error_code));
   status.values.push_back(value("receipt_time", decimal(item.receipt_time.toSec())));
-  if (item.source_sec != 0.0 || item.source_nsec != 0.0) {
+  status.values.push_back(value("last_transition_time", decimal(item.last_transition_time.toSec())));
+  const auto now = SteadyClock::now();
+  if (item.direction == "rx") {
+    status.values.push_back(value("stale_age_ms", decimal(1000.0 * ChannelFreshnessMonitor::age(
+        item.has_logical_publish, item.last_logical_publish, now))));
+  } else {
+    status.values.push_back(value("command_age_ms", decimal(1000.0 * ChannelFreshnessMonitor::age(
+        item.has_command, item.last_command, now))));
+  }
+  if (item.has_logical_publish && item.name != "gps") {
     status.values.push_back(value("last_source_sec", text(item.source_sec)));
     status.values.push_back(value("last_source_nsec", text(item.source_nsec)));
   }
-  for (const auto& extra : item.extra) status.values.push_back(value(extra.first, extra.second));
+  for (const auto& extra : item.extra) {
+    if (rich || (extra.first != "non_gga" && extra.first != "gga_utc"))
+      status.values.push_back(value(extra.first, extra.second));
+  }
   if (!rich) return status;
 
-  const auto now = SteadyClock::now();
+  status.values.push_back(value("state_since", decimal(item.state_since.toSec())));
+  status.values.push_back(value("last_error_time", decimal(item.last_error_time.toSec())));
+  if (item.name.compare(0, 7, "camera_") == 0) {
+    status.values.insert(status.values.end(), {
+        value("chunks", text(item.chunks)), value("completed_frames", text(item.completed_frames)),
+        value("dropped_frames", text(item.dropped_frames)), value("invalid_frames", text(item.invalid_frames)),
+        value("parse_error_count", text(item.parse_error))});
+  }
   std::size_t recent = 0U;
   SteadyClock::time_point first;
   for (const auto& event : item.event_times) {
@@ -398,6 +460,12 @@ SocketAction SocketRecoveryPolicy::classify(int error,
   return SocketAction::kKeep;
 }
 
+SocketAction TxSocketRecoveryPolicy::classify(int error,
+                                              unsigned int consecutive_errors) const {
+  return fatalSocketError(error) || consecutive_errors >= threshold_
+             ? SocketAction::kReopen : SocketAction::kKeep;
+}
+
 UdpRxWorker::UdpRxWorker(std::string name, std::string bind_ip,
                          std::uint16_t port, std::string allowed_source_ip,
                          std::size_t receive_buffer,
@@ -447,6 +515,7 @@ int UdpRxWorker::bindSocket() {
   actual /= 2;
 #endif
   reporter_->setSocketBuffer(name_, receive_buffer_, static_cast<std::size_t>(std::max(actual, 0)));
+  ROS_INFO("%s receive buffer: requested=%zu actual=%d", name_.c_str(), receive_buffer_, actual);
   return fd;
 }
 
@@ -460,6 +529,7 @@ void UdpRxWorker::closeSocket() {
 void UdpRxWorker::resetRuntimeState() {
   closeSocket();
   batch_.clear();
+  consecutive_errors_ = 0;
   reset_();
 }
 
@@ -467,55 +537,57 @@ void UdpRxWorker::start() { thread_ = std::thread(&UdpRxWorker::run, this); }
 
 void UdpRxWorker::stop() {
   stop_.store(true);
-  closeSocket();
   if (thread_.joinable()) thread_.join();
+}
+
+bool UdpRxWorker::drainBatch(std::array<std::uint8_t, 65535U>& buffer) {
+  while (!stop_.load()) {
+    sockaddr_in sender{};
+    socklen_t sender_size = sizeof(sender);
+    const ssize_t count = recvfrom(socket_, buffer.data(), buffer.size(), 0,
+                                   reinterpret_cast<sockaddr*>(&sender), &sender_size);
+    if (count >= 0) {
+      consecutive_errors_ = 0;
+      Datagram datagram;
+      datagram.ros_receipt = ros::Time::now();
+      datagram.steady_receipt = SteadyClock::now();
+      datagram.bytes.assign(buffer.begin(), buffer.begin() + count);
+      datagram.sender = senderIp(sender);
+      reporter_->received(name_, datagram);
+      if (UdpSourceFilter::accept(datagram.sender, allowed_source_ip_)) {
+        batch_.push_back(std::move(datagram));
+      } else {
+        reporter_->rejected(name_, datagram);
+      }
+      continue;
+    }
+    const int error = errno;
+    if (error == EAGAIN || error == EWOULDBLOCK) return true;
+    if (error != EINTR) ++consecutive_errors_;
+    const SocketAction action = recovery_.classify(error, consecutive_errors_);
+    if (action == SocketAction::kRetryImmediately) continue;
+    reporter_->socketError(name_, action == SocketAction::kReopen ? "SOCKET_REOPEN" : "RECV_ERROR",
+                           std::string("recvfrom: ") + std::strerror(error), ros::Time::now());
+    if (action == SocketAction::kReopen) {
+      resetRuntimeState();
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    return false;
+  }
+  return false;
 }
 
 void UdpRxWorker::run() {
   std::array<std::uint8_t, 65535U> buffer{};
-  unsigned int consecutive_errors = 0U;
   std::chrono::milliseconds backoff(100);
   while (!stop_.load() && ros::ok()) {
     try {
       if (socket_ < 0) {
         socket_ = bindSocket();
-        consecutive_errors = 0U;
+        consecutive_errors_ = 0U;
         backoff = std::chrono::milliseconds(100);
       }
-      bool drained = false;
-      while (!stop_.load()) {
-        sockaddr_in sender{};
-        socklen_t sender_size = sizeof(sender);
-        const ssize_t count = recvfrom(socket_, buffer.data(), buffer.size(), 0,
-                                       reinterpret_cast<sockaddr*>(&sender), &sender_size);
-        if (count >= 0) {
-          consecutive_errors = 0U;
-          Datagram datagram;
-          datagram.bytes.assign(buffer.begin(), buffer.begin() + count);
-          datagram.sender = senderIp(sender);
-          datagram.ros_receipt = ros::Time::now();
-          datagram.steady_receipt = SteadyClock::now();
-          reporter_->received(name_, datagram);
-          if (!allowed_source_ip_.empty() && datagram.sender != allowed_source_ip_) {
-            reporter_->rejected(name_, datagram);
-          } else {
-            batch_.push_back(std::move(datagram));
-          }
-          continue;
-        }
-        const int error = errno;
-        if (error == EAGAIN || error == EWOULDBLOCK) {
-          drained = true;
-          break;
-        }
-        ++consecutive_errors;
-        const SocketAction action = recovery_.classify(error, consecutive_errors);
-        if (action == SocketAction::kRetryImmediately) continue;
-        reporter_->socketError(name_, action == SocketAction::kReopen ? "SOCKET_REOPEN" : "RECV_ERROR",
-                               std::string("recvfrom: ") + std::strerror(error), ros::Time::now());
-        if (action == SocketAction::kReopen) resetRuntimeState();
-        break;
-      }
+      const bool drained = drainBatch(buffer);
       if (drained && !batch_.empty()) {
         std::vector<Datagram> batch;
         batch.swap(batch_);
@@ -527,7 +599,7 @@ void UdpRxWorker::run() {
       throw;
     } catch (const std::exception& error) {
       reporter_->workerException(name_, error.what(), ros::Time::now());
-      ROS_ERROR("%s worker exception: %s", name_.c_str(), error.what());
+      ROS_ERROR_THROTTLE(1.0, "%s worker exception: %s", name_.c_str(), error.what());
       resetRuntimeState();
       std::this_thread::sleep_for(backoff);
       backoff = std::min(backoff * 2, std::chrono::milliseconds(2000));
@@ -536,9 +608,8 @@ void UdpRxWorker::run() {
   closeSocket();
 }
 
-UdpSender::UdpSender(std::string ip, std::uint16_t port,
-                     unsigned int reopen_threshold)
-    : ip_(std::move(ip)), port_(port), threshold_(reopen_threshold) {
+UdpSender::UdpSender(std::string ip, std::uint16_t port)
+    : ip_(std::move(ip)), port_(port) {
   sockaddr_in address{};
   address.sin_family = AF_INET;
   address.sin_port = htons(port_);
@@ -546,7 +617,7 @@ UdpSender::UdpSender(std::string ip, std::uint16_t port,
     throw std::invalid_argument("invalid destination IP: " + ip_);
   address_.resize(sizeof(address));
   std::memcpy(address_.data(), &address, sizeof(address));
-  if (!open()) throw std::runtime_error("cannot create UDP sender");
+  open();
 }
 
 UdpSender::~UdpSender() { close(); }
@@ -557,14 +628,20 @@ bool UdpSender::open() {
   return socket_ >= 0;
 }
 
+bool UdpSender::reopen() {
+  consecutive_errors_ = 0;
+  return open();
+}
+
 void UdpSender::close() {
   if (socket_ >= 0) ::close(socket_);
   socket_ = -1;
 }
 
 bool UdpSender::send(const std::vector<std::uint8_t>& packet, int* error) {
-  if (socket_ < 0 && !open()) {
-    *error = errno;
+  if (socket_ < 0) {
+    *error = EBADF;
+    ++consecutive_errors_;
     return false;
   }
   const ssize_t sent = sendto(socket_, packet.data(), packet.size(), 0,
@@ -576,7 +653,6 @@ bool UdpSender::send(const std::vector<std::uint8_t>& packet, int* error) {
   }
   *error = sent < 0 ? errno : EMSGSIZE;
   ++consecutive_errors_;
-  if (fatalSocketError(*error) || consecutive_errors_ >= threshold_) open();
   return false;
 }
 
