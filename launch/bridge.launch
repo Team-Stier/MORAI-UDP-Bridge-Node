@@ -1,0 +1,10 @@
+<launch>
+  <arg name="config" default="$(find morai_udp_bridge)/config/config.yaml" />
+  <rosparam command="load" file="$(arg config)" ns="morai_udp_bridge" />
+  <node pkg="morai_udp_bridge"
+        type="morai_udp_bridge_node"
+        name="morai_udp_bridge"
+        output="screen"
+        respawn="true"
+        respawn_delay="1.0" />
+</launch>

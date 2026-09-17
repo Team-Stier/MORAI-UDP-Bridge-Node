@@ -1,0 +1,370 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>UDP Bridge Sequence</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 28px 28px 80px; background: #111213; color: #f2f2f0; font: 15px/1.45 ui-sans-serif, system-ui, sans-serif; }
+    h1 { margin: 0 0 12px; font-size: 25px; }
+    h2 { margin: 30px 0 12px; font-size: 20px; }
+    h3 { margin: 22px 0 10px; font-size: 17px; }
+    p { margin: 0; color: #aaa; }
+    table { width: 100%; border-collapse: collapse; margin: 0 0 34px; background: #18191b; }
+    th, td { border: 1px solid #3a3c40; padding: 9px 11px; text-align: left; vertical-align: top; }
+    th { background: #24262a; }
+    code { color: #d9e7ff; }
+    .diagram { width: 100%; padding: 24px; overflow-x: auto; background: #1b1c1e; }
+    .mermaid { text-align: center; }
+    .mermaid svg { max-width: 100% !important; height: auto; }
+    .mermaid svg text, .mermaid svg line, .mermaid svg path, .mermaid svg rect, .mermaid svg polygon { pointer-events: all; cursor: crosshair; }
+    .diagram { position: relative; }
+    .hit-layer { position: absolute; inset: 0; pointer-events: none; z-index: 10; }
+    .hit-target { position: absolute; min-width: 8px; min-height: 8px; pointer-events: auto; background: rgb(255 255 255 / 0.001); color: transparent; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <h1>UDP Bridge Sequence</h1>
+  <p>화살표나 글자를 찍어서 주석을 다세요. RX/TX는 한 페이지에서 스크롤합니다.</p>
+
+  <h2>RX</h2>
+  <div class="diagram">
+    <pre class="mermaid">
+sequenceDiagram
+    participant Config as InjectedConfig
+    participant ConfigValidator as ChannelConfigValidator
+    participant Worker as UdpRxWorker (one per port)
+    participant Socket as UdpSocket (one per port)
+    participant SourceFilter as UdpSourceFilter
+    participant Recovery as SocketRecoveryPolicy
+    participant Selector as LatestDatagramSelector (GPS/IMU/status)
+    participant Parser as Camera/Gps/Imu/StatusParser
+    participant Assembler as CameraFrameAssembler (camera only)
+    participant Inspector as RxValueInspector
+    participant Bridge as Camera/Gps/Imu/StatusBridge
+    participant Freshness as ChannelFreshnessMonitor
+    participant Reporter as DiagnosticsReporter
+    participant Topic as channel ROS topic
+    participant HighHzTopic as /diagnostics/high_hz
+    participant DiagTopic as /diagnostics
+
+    Note over Worker,Bridge: camera front :9291, left :9293, right :9295 are fully independent<br/>GPS :9301, IMU :9303, status :9094
+    Config->>ConfigValidator: validate RX port, topic, frame/calibration
+    alt channel config unusable
+        ConfigValidator->>Reporter: error(CONFIG_ERROR), disable only this channel
+        Reporter->>HighHzTopic: publishHighHz(CONFIG_ERROR, startup time)
+    else channel config usable
+        ConfigValidator-->>Worker: construct and start this channel
+    end
+    loop each port worker, independent of every other port and TX
+        loop drain kernel receive buffer
+            Worker->>Socket: recvfrom()
+            Socket-->>Worker: datagram, sender, receipt_time
+            Worker->>SourceFilter: accept(sender, allowed_source_ip)
+            alt sender rejected
+                SourceFilter->>Reporter: warn(SOURCE_REJECTED, sender)
+                Reporter->>HighHzTopic: publishHighHz(SOURCE_REJECTED, receipt_time)
+            else sender accepted
+                SourceFilter-->>Worker: append datagram to channel batch
+            end
+        end
+        Socket-->>Worker: EAGAIN = queue empty, normal drain end
+
+        alt channel processing throws std::exception except bad_alloc
+            Worker->>Reporter: error(WORKER_EXCEPTION, details)
+            Reporter->>HighHzTopic: publishHighHz(WORKER_EXCEPTION, now)
+            Worker->>Socket: close()
+            Worker->>Worker: resetRuntimeState(), discard current batch
+            opt camera channel
+                Worker->>Assembler: reset(), drop incomplete frame
+            end
+            Worker->>Worker: boundedBackoff()
+            Worker->>Socket: bind()
+        else recvfrom returned an actual error
+            Worker->>Recovery: classify(errno, consecutive_errors)
+            alt EINTR
+                Recovery-->>Worker: retry same recvfrom()
+            else transient and below reopen threshold
+                Recovery->>Reporter: warn(RECV_ERROR, errno), keep socket
+                Reporter->>HighHzTopic: publishHighHz(RECV_ERROR, receipt_time)
+                Recovery-->>Worker: continue next loop
+            else fatal or consecutive error threshold reached
+                Recovery->>Reporter: error(SOCKET_REOPEN, errno)
+                Reporter->>HighHzTopic: publishHighHz(SOCKET_REOPEN, receipt_time)
+                Recovery->>Socket: close(), bind() with bounded backoff
+            end
+        else camera channel batch
+            loop every camera datagram in arrival order
+                Worker->>Parser: decodeStructure(datagram)
+                alt unreadable header/length/tail
+                    Parser-->>Worker: STRUCTURAL_ERROR
+                    Worker->>Reporter: warn(STRUCTURAL_ERROR, raw metadata), drop datagram
+                    Reporter->>HighHzTopic: publishHighHz(STRUCTURAL_ERROR, receipt_time)
+                else decoded raw chunk
+                    Parser->>Inspector: inspect(raw fields)
+                    opt suspicious value
+                        Inspector->>Reporter: warn(VALUE_ANOMALY, raw value), do not modify
+                        Reporter->>HighHzTopic: publishHighHz(VALUE_ANOMALY, receipt_time)
+                    end
+                    Parser->>Assembler: add(raw chunk, receipt_time)
+                    alt incomplete frame
+                        Assembler->>Reporter: recordChunk(), no ROS publish
+                    else resource limit or invalid JPEG structure
+                        Assembler->>Reporter: warn(FRAME_DROPPED, reason), drop frame
+                        Reporter->>HighHzTopic: publishHighHz(FRAME_DROPPED, receipt_time)
+                    else complete JPEG frame
+                        Assembler->>Bridge: complete frame, first receipt_time
+                        Bridge->>Bridge: translateToRosMessage(frame, receipt_time)
+                        Bridge->>Topic: publish(translated_msg)
+                        Bridge->>Reporter: recordPublished(channel, lifetime)
+                        Reporter->>HighHzTopic: publishHighHz(PUBLISHED, receipt_time)
+                    end
+                end
+            end
+        else GPS, IMU, or status batch
+            Worker->>Selector: selectNewestDecodable(batch, Parser)
+            loop newest to oldest until target decode succeeds or batch ends
+                Selector->>Parser: decodeStructure(candidate)
+                Parser-->>Selector: decoded target, NON_TARGET, or STRUCTURAL_ERROR
+            end
+            alt GPS batch has only non-GGA NMEA
+                Selector->>Reporter: recordIgnored(NON_GGA), no ROS publish
+                Reporter->>HighHzTopic: publishHighHz(NON_GGA, receipt_time)
+            else no structurally decodable target datagram
+                Selector->>Reporter: warn(STRUCTURAL_ERROR, rejected count)
+                Reporter->>HighHzTopic: publishHighHz(STRUCTURAL_ERROR, receipt_time)
+            else newest decodable sample selected
+                Selector->>Reporter: recordSuperseded(older count)
+                Selector->>Inspector: inspect(raw fields)
+                opt suspicious value including zero/non-finite/out-of-range
+                    Inspector->>Reporter: warn(VALUE_ANOMALY, raw value), do not modify
+                    Reporter->>HighHzTopic: publishHighHz(VALUE_ANOMALY, receipt_time)
+                end
+                Inspector->>Bridge: decoded raw unchanged
+                Bridge->>Bridge: translateToRosMessage(decoded, receipt_time)
+                Bridge->>Topic: publish(translated_msg)
+                Bridge->>Reporter: recordPublished(channel, lifetime)
+                Reporter->>HighHzTopic: publishHighHz(PUBLISHED, receipt_time)
+            end
+        end
+    end
+
+    loop independent stale check
+        Freshness->>Reporter: check(now - last logical publish)
+        alt stale timeout exceeded
+            Reporter->>Reporter: WARN/ERROR STALE, no sensor republish
+            Reporter->>HighHzTopic: publishHighHz(STALE, now)
+        else recovered by a new logical publish
+            Reporter->>HighHzTopic: publishHighHz(OK_RECOVERY, receipt_time)
+        end
+    end
+
+    loop every 1 second
+        Reporter->>Reporter: snapshotAllChannels()
+        Reporter->>DiagTopic: publishRichDiagnostics(snapshot)
+    end
+
+    </pre>
+  </div>
+
+  <h3>RX 객체와 메서드</h3>
+  <table>
+    <thead><tr><th>객체</th><th>주요 메서드</th><th>책임과 구현 주의사항</th></tr></thead>
+    <tbody>
+      <tr><td><code>UdpRxWorker</code></td><td><code>run()</code>, <code>drainBatch()</code>, <code>resetRuntimeState()</code></td><td>포트 하나의 socket을 EAGAIN까지 비운다. recoverable exception이면 해당 socket, batch, 연속 오류와 parser 임시 상태를 초기화하고 카메라 assembler도 비운 뒤 다시 bind한다.</td></tr>
+      <tr><td><code>UdpSourceFilter</code></td><td><code>accept(sender)</code></td><td>sender IP만 비교하며 payload 값은 판단하지 않는다.</td></tr>
+      <tr><td><code>SocketRecoveryPolicy</code></td><td><code>classify(errno, count)</code></td><td>EAGAIN, EINTR, 일시 오류와 socket-local fatal 오류를 분류한다.</td></tr>
+      <tr><td><code>LatestDatagramSelector</code></td><td><code>selectNewestDecodable()</code></td><td>newest-to-oldest로 구조 decode하여 최신 target 하나만 반환한다.</td></tr>
+      <tr><td>각 <code>Parser</code></td><td><code>decodeStructure()</code></td><td>field 경계만 검증하고 raw 값을 decode한다. 물리값을 보정하지 않는다.</td></tr>
+      <tr><td><code>CameraFrameAssembler</code></td><td><code>add()</code></td><td>카메라별 chunk를 도착 순서로 조립하며 채널 간 상태를 공유하지 않는다.</td></tr>
+      <tr><td><code>RxValueInspector</code></td><td><code>inspect()</code></td><td>의심 값을 진단하지만 값을 바꾸거나 publish를 막지 않는다.</td></tr>
+      <tr><td>각 <code>Bridge</code></td><td><code>translateToRosMessage()</code>, <code>publish()</code></td><td>문서화된 표현·단위 변환만 수행한다. 좌표 회전, clamp, normalization, 추정은 하지 않는다.</td></tr>
+      <tr><td><code>ChannelFreshnessMonitor</code></td><td><code>check()</code></td><td>stale와 복구만 판정하며 센서값을 재발행하지 않는다.</td></tr>
+      <tr><td><code>DiagnosticsReporter</code></td><td><code>warnAndPublishHighHz()</code>, <code>recordPublishedAndPublishHighHz()</code></td><td>처리 결과 직후 같은 RX 경로에서 high-hz 진단을 발행한다.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>TX</h2>
+  <div class="diagram">
+    <pre class="mermaid">
+sequenceDiagram
+    participant Config as InjectedConfig
+    participant ConfigValidator as ChannelConfigValidator
+    participant CommandTopic as /morai_udp_bridge/control_cmd
+    participant Tx as ControlTx
+    participant Sanitizer as ControlCommandSanitizer
+    participant Latest as LatestCommand
+    participant Guard as CommandFreshnessGuard
+    participant Encoder as MoraiControlEncoder
+    participant Sender as UdpSender (:9093 Ego Ctrl Cmd)
+    participant SendRecovery as TxSocketRecoveryPolicy
+    participant LampTopic as /morai_udp_bridge/lamp_cmd (optional)
+    participant LampTx as LampTx
+    participant LampSanitizer as LampCommandSanitizer
+    participant LampEncoder as MoraiLampEncoder
+    participant LampSender as UdpSender (configured Lamp Control port)
+    participant Reporter as DiagnosticsReporter
+    participant HighHzTopic as /diagnostics/high_hz
+    participant DiagTopic as /diagnostics
+    participant Timer as send_timer_ 50Hz
+
+    Config->>ConfigValidator: validate TX destination, rate, safe brake
+    alt TX config unusable
+        ConfigValidator->>Reporter: error(CONFIG_ERROR), disable TX only
+        Reporter->>HighHzTopic: publishHighHz(CONFIG_ERROR, startup time)
+    else TX config usable
+        ConfigValidator-->>Tx: construct and start TX
+    end
+    CommandTopic->>Tx: onCommand(morai_msgs/CtrlCmd, receipt_time)
+    Tx->>Sanitizer: sanitize(command)
+    alt non-finite, pedal conflict, or accel/brake/steering out of range
+        Sanitizer->>Reporter: warn(SANITIZED_COMMAND, before, after)
+        Sanitizer-->>Tx: explicit safe replacement
+    else command unchanged
+        Sanitizer->>Reporter: recover(SANITIZED_COMMAND)
+        Sanitizer-->>Tx: original command
+    end
+    Tx->>Latest: store(selected command, receipt_time)
+    Reporter->>HighHzTopic: publishHighHz(COMMAND_ACCEPTED, receipt_time)
+
+    loop every 20 ms, independent of RX
+        Timer->>Tx: onSendTimer()
+        Tx->>Latest: snapshot()
+        Latest-->>Tx: latest, age
+        Tx->>Guard: select(latest, age, stale_timeout)
+        alt command is fresh
+            Guard->>Reporter: recover(STALE_COMMAND)
+            Guard-->>Tx: unchanged latest command
+        else command is stale
+            Guard->>Reporter: warn(STALE_COMMAND, age, safe_brake)
+            Guard-->>Tx: configured safe_brake overlay
+        end
+        Tx->>Encoder: encodeMode1(selected, gear=4)
+        Encoder-->>Tx: 55-byte packet, mode=1, velocity=0, acceleration=0
+        Tx->>Sender: send(packet)
+        alt send error
+            Sender-->>Tx: error
+            Tx->>Reporter: error(TX_SEND_ERROR, details)
+            Tx->>SendRecovery: classify(errno, consecutive_errors)
+            alt socket-local fatal or reopen threshold reached
+                SendRecovery->>Sender: reopen()
+            else transient or network error
+                SendRecovery-->>Tx: keep socket, retry next 20 ms tick
+            end
+        else sent
+            Sender-->>Tx: bytes sent
+            Tx->>Reporter: recordSent(lifetime)
+        end
+        Reporter->>HighHzTopic: publishHighHz(TX result, send-loop time)
+    end
+
+    opt MORAI Lamp Control channel is configured
+        LampTopic->>LampTx: onLamps(morai_msgs/Lamps, receipt_time)
+        LampTx->>LampSanitizer: sanitize(lamps)
+        alt lamp value is outside documented enum
+            LampSanitizer->>Reporter: warn(LAMP_VALUE_ANOMALY, before, off)
+            LampSanitizer-->>LampTx: invalid field replaced with 0 (off)
+        else lamp command unchanged
+            LampSanitizer-->>LampTx: original lamp command
+        end
+        LampTx->>LampEncoder: encode(turnSignal, emergencySignal)
+        LampEncoder-->>LampTx: 33-byte Lamp Control packet
+        LampTx->>LampSender: send(packet)
+        alt lamp send error
+            LampSender-->>LampTx: error
+            LampTx->>Reporter: error(LAMP_TX_SEND_ERROR, details)
+            LampTx->>SendRecovery: classify(errno, consecutive_errors)
+            alt socket-local fatal or reopen threshold reached
+                SendRecovery->>LampSender: reopen()
+            else transient or network error
+                SendRecovery-->>LampTx: keep socket, wait for next command
+            end
+        else lamp packet sent
+            LampSender-->>LampTx: bytes sent
+            LampTx->>Reporter: recordSent(lamp)
+        end
+        Reporter->>HighHzTopic: publishHighHz(lamp TX result, send time)
+    end
+
+    loop every 1 second
+        Reporter->>Reporter: snapshotAllChannels()
+        Reporter->>DiagTopic: publishRichDiagnostics(snapshot)
+    end
+
+    </pre>
+  </div>
+
+  <h3>TX 객체와 메서드</h3>
+  <table>
+    <thead><tr><th>객체</th><th>주요 메서드</th><th>책임과 구현 주의사항</th></tr></thead>
+    <tbody>
+      <tr><td><code>ControlTx</code></td><td><code>onCommand()</code>, <code>onSendTimer()</code></td><td>callback과 50Hz 송신을 조정하며 검증·보정·직렬화를 직접 하지 않는다.</td></tr>
+      <tr><td><code>ControlCommandSanitizer</code></td><td><code>sanitize()</code></td><td>accel/brake/steering의 non-finite를 0으로 바꾸고 범위를 clamp하며 페달 충돌에는 brake를 우선한다.</td></tr>
+      <tr><td><code>LatestCommand</code></td><td><code>store()</code>, <code>snapshot()</code></td><td>sanitize된 최신 명령 하나와 monotonic receipt time만 보관한다.</td></tr>
+      <tr><td><code>CommandFreshnessGuard</code></td><td><code>select()</code></td><td>fresh 명령 또는 공개된 safe-brake overlay를 선택한다.</td></tr>
+      <tr><td><code>MoraiControlEncoder</code></td><td><code>encodeMode1()</code></td><td>mode=1, gear=D(4), velocity=0, acceleration=0 상수와 선택된 accel/brake/steering을 55-byte packet으로 직렬화한다.</td></tr>
+      <tr><td><code>LampCommandSanitizer</code></td><td><code>sanitize()</code></td><td>잘못된 lamp 필드만 0=off로 바꾸며 비상등을 임의 점등하지 않는다.</td></tr>
+      <tr><td><code>MoraiLampEncoder</code></td><td><code>encode()</code></td><td>sanitize된 값을 33-byte packet으로 직렬화한다.</td></tr>
+      <tr><td><code>TxSocketRecoveryPolicy</code></td><td><code>classify()</code></td><td>일시·network 오류는 socket을 유지하고 socket-local fatal/연속 오류에서만 해당 sender를 reopen한다.</td></tr>
+      <tr><td><code>DiagnosticsReporter</code></td><td><code>recordSentAndPublishHighHz()</code></td><td>command 처리와 UDP send 결과 직후 같은 TX 경로에서 high-hz 진단을 발행한다.</td></tr>
+    </tbody>
+  </table>
+
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: false, theme: "dark", securityLevel: "loose", sequence: { useMaxWidth: true, wrap: true, diagramMarginX: 24 } });
+
+    function installHitTargets(diagram) {
+      diagram.querySelector(".hit-layer")?.remove();
+      const svg = diagram.querySelector("svg");
+      if (!svg) return;
+
+      const layer = document.createElement("div");
+      layer.className = "hit-layer";
+      diagram.append(layer);
+      const diagramRect = diagram.getBoundingClientRect();
+      const selectors = [
+        "g.actor", "text.messageText", "text.loopText", "text.labelText", "text.noteText",
+        ".messageLine0", ".messageLine1", ".loopLine", ".labelBox", ".note"
+      ];
+
+      for (const node of svg.querySelectorAll(selectors.join(","))) {
+        const rect = node.getBoundingClientRect();
+        if (!rect.width && !rect.height) continue;
+        const label = node.textContent.trim() || node.getAttribute("class") || "diagram element";
+        const hit = document.createElement("div");
+        hit.className = "hit-target";
+        hit.textContent = label;
+        hit.title = label;
+        hit.style.left = `${rect.left - diagramRect.left + diagram.scrollLeft}px`;
+        hit.style.top = `${rect.top - diagramRect.top + diagram.scrollTop - 5}px`;
+        hit.style.width = `${Math.max(rect.width, 12)}px`;
+        hit.style.height = `${Math.max(rect.height + 10, 14)}px`;
+        layer.append(hit);
+      }
+    }
+
+    for (const [index, element] of [...document.querySelectorAll(".mermaid")].entries()) {
+      try {
+        const { svg } = await mermaid.render(`sequence-${index}`, element.textContent.trim());
+        element.innerHTML = svg;
+      } catch (error) {
+        element.textContent = error.message;
+      }
+    }
+    for (const diagram of document.querySelectorAll(".diagram")) installHitTargets(diagram);
+    document.fonts.ready.then(() => {
+      for (const diagram of document.querySelectorAll(".diagram")) installHitTargets(diagram);
+    });
+    let resizeFrame;
+    addEventListener("resize", () => {
+      cancelAnimationFrame(resizeFrame);
+      resizeFrame = requestAnimationFrame(() => {
+        for (const diagram of document.querySelectorAll(".diagram")) installHitTargets(diagram);
+      });
+    });
+  </script>
+</body>
+</html>
