@@ -108,24 +108,24 @@ TEST(ImuProtocol, NonFiniteValueDoesNotBecomeStructuralError) {
 }
 
 TEST(StatusProtocol, DecodesMolitComp03Layout) {
-  std::vector<std::uint8_t> packet(181U, 0U);
+  std::vector<std::uint8_t> packet(245U, 0U);
   std::memcpy(packet.data(), "#MoraiInfo$", 11U);
-  writeU32(&packet, 11U, 152U);
+  writeU32(&packet, 11U, 216U);
   const std::size_t payload = 27U;
-  writeU32(&packet, payload + 0U, 123U);
-  writeU32(&packet, payload + 4U, 456000000U);
+  writeF32(&packet, payload + 0U, 123.0F);
+  writeF32(&packet, payload + 4U, 456000000.0F);
   packet[payload + 8U] = 1U;
   packet[payload + 9U] = 4U;
   writeF32(&packet, payload + 10U, 36.0F);
   writeF32(&packet, payload + 110U, 15.0F);
-  std::memcpy(packet.data() + payload + 114U, "LINK_42", 7U);
-  packet[179U] = '\r';
-  packet[180U] = '\n';
+  std::memcpy(packet.data() + payload + 118U, "LINK_42", 7U);
+  packet[243U] = '\r';
+  packet[244U] = '\n';
 
   const VehicleStatusSample sample =
       decodeVehicleStatusPacket(packet.data(), packet.size());
-  EXPECT_EQ(123, sample.source_sec);
-  EXPECT_EQ(456000000, sample.source_nsec);
+  EXPECT_FLOAT_EQ(123.0F, sample.source_sec);
+  EXPECT_FLOAT_EQ(456000000.0F, sample.source_nsec);
   EXPECT_EQ(1U, sample.control_mode);
   EXPECT_EQ(4U, sample.gear);
   EXPECT_FLOAT_EQ(10.0F, sample.signed_velocity_mps);

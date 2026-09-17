@@ -74,7 +74,8 @@ class RxValueInspector {
     return {};
   }
   static std::string status(const VehicleStatusSample& sample) {
-    if (sample.source_nsec < 0 || sample.source_nsec >= 1000000000)
+    if (!std::isfinite(sample.source_nsec) || sample.source_nsec < 0.0F ||
+        sample.source_nsec >= 1000000000.0F)
       return "status nsec is outside range";
     if (sample.control_mode < 1U || sample.control_mode > 2U) return "status control_mode is unknown";
     if (sample.gear > 5U) return "status gear is unknown";
@@ -347,16 +348,12 @@ class BridgeNode {
       reporter_(node_, param(private_, "diagnostics_topic", std::string("/diagnostics")),
                 param(private_, "high_hz_diagnostics_topic", std::string("/diagnostics/high_hz")),
                 param(private_, "diagnostics_period", 1.0)) {
-    setupControl();
     setupRx();
+    setupControl();
     setupLamp();
     stale_timer_ = node_.createWallTimer(ros::WallDuration(0.05), [this](const ros::WallTimerEvent&) {
       reporter_.checkStale();
     });
-  }
-
-  ~BridgeNode() {
-    for (auto& worker : workers_) worker->stop();
   }
 
   void start() {
@@ -431,36 +428,22 @@ class BridgeNode {
       const int port = requiredParam<int>(private_, "status/port");
       const std::string topic = requiredParam<std::string>(private_, "status/topic");
       const double stale = requiredParam<double>(private_, "status/stale_timeout");
-      ChannelConfigValidator::validatePort(port);
-      reporter_.addChannel("status", "rx", static_cast<std::uint16_t>(port), topic, stale);
-      reporter_.setSocketBuffer("status",
-                                param(private_, "receive_buffer_bytes", 4194304),
-                                control_socket_->actualReceiveBuffer());
       status_.reset(new StatusBridge(node_, topic, requiredParam<std::string>(private_, "vehicle_spec/base_frame_id"), &reporter_));
-      workers_.emplace_back(new CompetitionRxWorker(
-          "status", param(private_, "allowed_source_ip", std::string()),
-          param(private_, "recv_error_reopen_threshold", 3),
-          [this](std::vector<Datagram> batch) { status_->handle(std::move(batch)); },
-          [this]() { status_->reset(); }, &reporter_, control_socket_.get()));
+      addWorker("status", port, topic, stale,
+                [this](std::vector<Datagram> batch) { status_->handle(std::move(batch)); },
+                [this]() { status_->reset(); });
     }
   }
 
   void setupControl() {
-    const int destination_port = requiredParam<int>(private_, "control/destination_port");
-    const int source_port = requiredParam<int>(private_, "status/port");
-    ChannelConfigValidator::validatePort(destination_port);
-    ChannelConfigValidator::validatePort(source_port);
+    const int port = requiredParam<int>(private_, "control/destination_port");
+    ChannelConfigValidator::validatePort(port);
     const double rate = requiredParam<double>(private_, "control/send_rate_hz");
     ChannelConfigValidator::validatePositive(rate, "control send_rate_hz");
-    reporter_.addChannel("control_tx", "tx", destination_port,
+    reporter_.addChannel("control_tx", "tx", port,
                          requiredParam<std::string>(private_, "control/command_topic"), 0.0);
-    control_socket_.reset(new ControlUdpSocket(
-        requiredParam<std::string>(private_, "control/destination_ip"),
-        static_cast<std::uint16_t>(destination_port),
-        param(private_, "bind_ip", std::string("0.0.0.0")),
-        static_cast<std::uint16_t>(source_port),
-        param(private_, "receive_buffer_bytes", 4194304),
-        requiredParam<int>(private_, "control/send_error_reopen_threshold")));
+    control_sender_.reset(new UdpSender(requiredParam<std::string>(private_, "control/destination_ip"), port,
+                                        requiredParam<int>(private_, "control/send_error_reopen_threshold")));
     freshness_.reset(new CommandFreshnessGuard(
         requiredParam<double>(private_, "control/command_timeout_sec"),
         requiredParam<double>(private_, "control/safe_brake_command")));
@@ -506,7 +489,7 @@ class BridgeNode {
     else reporter_.recovered("control_tx", "STALE_COMMAND_RECOVERED", ros::Time::now());
     const std::vector<std::uint8_t> packet = control_encoder_.encodeMode1(selected);
     int error = 0;
-    if (control_socket_->send(packet, &error)) reporter_.sent("control_tx", ros::Time::now(), started);
+    if (control_sender_->send(packet, &error)) reporter_.sent("control_tx", ros::Time::now(), started);
     else reporter_.sendError("control_tx", std::strerror(error), ros::Time::now());
   }
 
@@ -526,7 +509,7 @@ class BridgeNode {
   ros::NodeHandle node_;
   ros::NodeHandle private_;
   DiagnosticsReporter reporter_;
-  std::vector<std::unique_ptr<UdpRxWorkerBase>> workers_;
+  std::vector<std::unique_ptr<UdpRxWorker>> workers_;
   std::vector<std::unique_ptr<CameraBridge>> camera_bridges_;
   std::unique_ptr<GpsBridge> gps_;
   std::unique_ptr<ImuBridge> imu_;
@@ -535,7 +518,7 @@ class BridgeNode {
   MoraiControlEncoder control_encoder_;
   LatestCommand latest_;
   std::unique_ptr<CommandFreshnessGuard> freshness_;
-  std::unique_ptr<ControlUdpSocket> control_socket_;
+  std::unique_ptr<UdpSender> control_sender_;
   LampCommandSanitizer lamp_sanitizer_;
   MoraiLampEncoder lamp_encoder_;
   std::unique_ptr<UdpSender> lamp_sender_;
