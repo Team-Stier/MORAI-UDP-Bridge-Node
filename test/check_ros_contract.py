@@ -4,9 +4,11 @@ import copy
 import os
 from pathlib import Path
 import socket
+import signal
 import struct
 import subprocess
 import time
+import tempfile
 
 import yaml
 
@@ -53,38 +55,62 @@ def main():
         wait_for(rosgraph.is_master_online, "private master did not start")
         rospy.init_node("contract_check", disable_signals=True)
         config = yaml.safe_load((Path(__file__).resolve().parents[1] / "config/config.yaml").read_text())
-        config.update(bind_ip="127.0.0.1", allowed_source_ip="127.0.0.1", diagnostics_period=0.1)
+        config.update(bind_ip="127.0.0.1", allowed_source_ip="127.0.0.1")
         config["vehicle_spec"] = dict(base_frame_id="base_link", gps_frame_id="gps", imu_frame_id="imu",
             cameras={name: dict(frame_id=name, width=640, height=480, horizontal_fov_deg=90.0)
                      for name in ("front", "left", "right")})
         for channel in list(config["cameras"].values()) + [config[name] for name in ("gps", "imu", "status")]:
             channel["port"] = free_port()
         config["control"].update(destination_ip="127.0.0.1", destination_port=free_port())
-        rich, high, images, infos = {}, [], [], []
+        latest, high, images, infos = {}, [], [], []
 
-        def collect_rich(message):
+        def collect_latest(message):
+            high.append(message)
             for status in message.status:
-                rich[status.name.rsplit("/", 1)[-1]] = dict((v.key, v.value) for v in status.values)
+                latest[status.name.rsplit("/", 1)[-1]] = dict((v.key, v.value) for v in status.values)
 
         subscriptions = [
-            rospy.Subscriber("/diagnostics", DiagnosticArray, collect_rich, queue_size=100),
-            rospy.Subscriber("/diagnostics/high_hz", DiagnosticArray, high.append, queue_size=100),
+            rospy.Subscriber("/diagnostics/high_hz", DiagnosticArray, collect_latest, queue_size=100),
             rospy.Subscriber(config["cameras"]["front"]["topic"], CompressedImage, images.append, queue_size=10),
             rospy.Subscriber(config["cameras"]["front"]["camera_info_topic"], CameraInfo, infos.append, queue_size=10),
         ]
         command = rospy.Publisher(config["control"]["command_topic"], CtrlCmd, queue_size=1)
 
+        node_log = tempfile.TemporaryFile(mode="w+")
+
         def launch(settings):
             rospy.set_param("/contract_bridge", settings)
             return subprocess.Popen(["rosrun", "morai_udp_bridge", "morai_udp_bridge_node", "__name:=contract_bridge"],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+                                    stdout=node_log, stderr=subprocess.STDOUT)
 
         node = launch(config)
-        wait_for(lambda: command.get_num_connections() and len(rich) == 7, "channels not initialized")
-        wait_for(lambda: rich["control_tx"].get("sent", "0") != "0", "TX not sending")
-        assert rich["control_tx"]["error_code"] == "STALE_COMMAND", rich["control_tx"]
-        assert all(key in rich["control_tx"] for key in ("state_since", "last_error_time", "last_transition_time", "command_age_ms"))
+        wait_for(lambda: command.get_num_connections() and "control_tx" in latest, "channels not initialized")
+        wait_for(lambda: latest["control_tx"].get("sent", "0") != "0", "TX not sending")
+        assert latest["control_tx"]["error_code"] == "STALE_COMMAND", latest["control_tx"]
+        assert all(key in latest["control_tx"] for key in ("state_since", "last_error_time", "last_transition_time", "command_age_ms"))
+        assert "hz" not in latest["control_tx"] and "lifetime_p95_ms" not in latest["control_tx"]
+        assert "/diagnostics" not in dict(rospy.get_published_topics())
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            def nmea(body):
+                checksum = 0
+                for char in body:
+                    checksum ^= ord(char)
+                return ("$%s*%02X\r\n" % (body, checksum)).encode()
+
+            node.send_signal(signal.SIGSTOP)
+            time.sleep(0.05)
+            gps_address = ("127.0.0.1", config["gps"]["port"])
+            udp.sendto(nmea("GPGGA,123519,3723.2475,N,12702.3416,E,1,03,5.2,10.0,M,20.0,M,,"), gps_address)
+            udp.sendto(nmea("GPRMC,123519"), gps_address)
+            udp.sendto(nmea("GPGGA,broken"), gps_address)
+            udp.sendto(nmea("GPGGA,broken"), gps_address)
+            node.send_signal(signal.SIGCONT)
+            wait_for(lambda: latest.get("gps", {}).get("published") == "1", "GPS fallback not published")
+            assert latest["gps"]["parse_error"] == "2", latest["gps"]
+            assert latest["gps"]["non_gga"] == "1", latest["gps"]
+            assert any(s.name.endswith("/gps") and s.level == 1 and
+                       any(v.key == "error_code" and v.value == "STRUCTURAL_ERROR" for v in s.values)
+                       for msg in high for s in msg.status)
             destination = ("127.0.0.1", config["cameras"]["front"]["port"])
 
             def chunk(index, payload, final=False, frame=1):
@@ -102,14 +128,21 @@ def main():
             chunk(0, b"broken", True, 2)
             chunk(0, b"\xff\xd8", frame=3)
             chunk(0, b"\xff\xd8\xff\xd9", True, 4)
-            wait_for(lambda: int(rich["camera_front"].get("completed_frames", 0)) == 2, "camera counters not updated")
-            camera = rich["camera_front"]
+            wait_for(lambda: int(latest["camera_front"].get("completed_frames", 0)) == 2, "camera counters not updated")
+            camera = latest["camera_front"]
             assert int(camera["chunks"]) == 5 and int(camera["invalid_frames"]) == 1, camera
             assert int(camera["dropped_frames"]) >= 2, camera
+            node.send_signal(signal.SIGSTOP)
+            time.sleep(0.05)
+            for frame in range(100, 140):
+                chunk(0, b"\xff\xd8\xff\xd9", True, frame)
+            node.send_signal(signal.SIGCONT)
+            wait_for(lambda: int(latest["camera_front"].get("completed_frames", 0)) == 42,
+                     "bounded camera batches lost chunks")
         command.publish(CtrlCmd(accel=float("nan"), brake=1.4, steering=-2.0))
-        wait_for(lambda: rich["control_tx"].get("sanitized") == "1", "sanitize not recorded")
-        assert "nan" in rich["control_tx"]["before"], rich["control_tx"]
-        assert "accel=0,brake=1,steering=-1" == rich["control_tx"]["after"]
+        wait_for(lambda: latest["control_tx"].get("sanitized") == "1", "sanitize not recorded")
+        assert "nan" in latest["control_tx"]["before"], latest["control_tx"]
+        assert "accel=0,brake=1,steering=-1" == latest["control_tx"]["after"]
         assert any(any(v.key == "before" and "nan" in v.value for s in msg.status for v in s.values) for msg in high)
         stop(node)
 
@@ -120,12 +153,16 @@ def main():
         broken["lamp_control"].update(enabled=True, destination_port=-1)
         broken["cameras"]["left"]["camera_info_topic"] = "invalid topic"
         del broken["vehicle_spec"]["cameras"]["right"]["width"]
-        rich.clear()
+        latest.clear()
         node = launch(broken)
         failed = ("gps", "imu", "status", "control_tx", "lamp_tx", "camera_left", "camera_right")
-        wait_for(lambda: all(rich.get(name, {}).get("error_code") == "CONFIG_ERROR" for name in failed),
-                 "configuration errors escaped channel boundary")
-        assert node.poll() is None and "camera_front" in rich
+        def isolated_errors_logged():
+            node_log.seek(0)
+            output = node_log.read()
+            return all(name + ": CONFIG_ERROR" in output for name in failed)
+
+        wait_for(isolated_errors_logged, "configuration errors escaped channel boundary")
+        assert node.poll() is None
         print("PASS: first-chunk stamp, diagnostics/counters, sanitize, channel isolation")
     finally:
         stop(node)

@@ -19,17 +19,5 @@ done
 HELPER="${PACKAGE_SHARE}/scripts/network_launch.py"
 [[ -f "$HELPER" ]] || HELPER="${PACKAGE_DIR}/network_launch.py"
 RUNTIME_CONFIG="$(python3 "$HELPER" "$CONFIG")"
-roslaunch morai_udp_bridge bridge.launch \
-    "config:=${RUNTIME_CONFIG}" "${ROSLAUNCH_ARGS[@]}" &
-ROSLAUNCH_PID=$!
-
-HEALTH_MONITOR="${PACKAGE_SHARE}/scripts/monitor_packet_health.py"
-[[ -f "$HEALTH_MONITOR" ]] || HEALTH_MONITOR="${PACKAGE_DIR}/scripts/monitor_packet_health.py"
-python3 "$HEALTH_MONITOR" "$RUNTIME_CONFIG" &
-MONITOR_PID=$!
-
-cleanup() {
-    kill "$MONITOR_PID" "$ROSLAUNCH_PID" 2>/dev/null || true
-}
-trap cleanup EXIT INT TERM
-wait "$ROSLAUNCH_PID"
+exec roslaunch morai_udp_bridge bridge.launch \
+    "config:=${RUNTIME_CONFIG}" "${ROSLAUNCH_ARGS[@]}"

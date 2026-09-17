@@ -38,7 +38,7 @@ MORAI msg를 다시 정의하지 않는다.
 ### 설정
 
 기본 운행 값은 이 패키지 [`config/config.yaml`](config/config.yaml)이다.
-포트, 토픽, stale, send rate, diagnostics 주기를 여기서 관리한다.
+포트, 토픽, stale, send rate, diagnostics 토픽을 여기서 관리한다.
 
 차량 제원처럼 여러 실행 패키지가 같이 쓰는 값은 메인 `catkin_ws`의 전역
 config에 두고, 전역 `run.sh`가 각 실행 패키지 config에 주입한다.
@@ -54,9 +54,9 @@ config에 두고, 전역 `run.sh`가 각 실행 패키지 config에 주입한다
 
 `launch.sh`는 자기 노드만 기동한다. 다른 실행 패키지의 launch를 호출하지 않는다.
 
-`launch.sh`는 네트워크 profile을 검증한 뒤 package launch 파일의 `roslaunch`와
-packet-health helper를 자식 프로세스로 실행하고 `roslaunch`를 `wait`한다.
-helper는 채널별 수신 상태를 로그로 남긴 뒤 종료하며, node 재시작은
+`launch.sh`는 네트워크 profile을 검증한 뒤 package launch 파일을 `exec roslaunch`로
+실행한다. 별도 packet-health helper는 실행하지 않는다. 외부 노드는 필요하면
+`/diagnostics/high_hz`를 직접 구독한다. node 재시작은
 `roslaunch`의 respawn이 담당한다. 스크립트에 별도 node 재시작 루프는 만들지 않는다.
 
 #### 네트워크 launch option
@@ -66,8 +66,8 @@ helper는 채널별 수신 상태를 로그로 남긴 뒤 종료하며, node 재
 
 | 값 | 동작 |
 | ---: | --- |
-| `1` | same-PC profile을 먼저 probe한다. `same_pc_probe_timeout_sec`까지 packet이 없으면 remote-PC profile로 넘어가 계속 기다린다. |
-| `2` | same-PC를 건너뛰고 remote-PC packet이 올 때까지 계속 기다린다. |
+| `1` | same-PC profile의 네트워크 설정 후 즉시 기동한다. |
+| `2` | remote-PC profile의 네트워크 설정 후 즉시 기동한다. |
 
 각 profile에는 `bridge_ip`와 `simulator_ip`를 둔다. same-PC 기본값은 양쪽 모두
 `127.0.0.1`이다. 두 PC를 유선 LAN으로 연결할 때 remote-PC의 `bridge_ip`에는 브릿지
@@ -79,9 +79,6 @@ remote profile의 선택적 `interface`에 NIC 이름을 명시한다.
 ```yaml
 network_launch:
   launch_option: 2
-  probe_port: 9303
-  same_pc_probe_timeout_sec: 3.0
-  wait_log_period_sec: 5.0
   open_ufw_for_remote: true
   same_pc:
     bridge_ip: 127.0.0.1
@@ -100,18 +97,15 @@ network_launch:
 2. remote profile에서는 Ubuntu `ufw`가 활성화된 경우 camera/GPS/IMU/status RX
    UDP 포트를 `simulator_ip`에 한해서 연다. 비대화식 sudo 권한이 없으면 launch하지
    않고 필요한 port를 출력한다.
-3. `probe_port`를 잠시 bind하고 지정한 `simulator_ip`에서 실제 UDP datagram이
-   도착하는지 확인한다. probe socket은 node 실행 전에 닫힌다.
-4. 성공한 profile을 원본 YAML에 덮어쓰지 않고 임시 YAML의 `bind_ip`,
+3. UDP 도착을 기다리지 않는다. probe와 option 1→2 자동 fallback은 사용하지 않는다.
+4. 선택한 profile을 원본 YAML에 덮어쓰지 않고 임시 YAML의 `bind_ip`,
    `allowed_source_ip`, control/lamp `destination_ip`에 주입한다.
-5. 임시 YAML로 `roslaunch`와 packet-health helper를 백그라운드 실행한다.
-   `launch.sh`는 `roslaunch` 종료까지 기다리고 종료 signal 시 자식 프로세스를 정리한다.
+5. 임시 YAML로 `exec roslaunch`한다.
 
-UDP에는 연결 handshake나 ACK가 없으므로 여기서 "연결 성공"은 지정한 MORAI IP에서
-실제 sensor datagram 하나를 받은 상태다. `launch.sh`는 MORAI GUI의 Network Settings를
+기동 완료는 UDP 수신 성공을 뜻하지 않는다. 실제 채널 상태는
+`/diagnostics/high_hz` 구독자가 확인한다. `launch.sh`는 MORAI GUI의 Network Settings를
 변경할 수 없다. MORAI의 각 sensor Destination IP/Port는 선택될 profile의
 `bridge_ip`와 이 YAML의 RX port를 향하도록 미리 설정해야 한다. 특히 option 1의
-remote fallback이 동작하려면 remote MORAI가 이미 remote profile로 송신 중이어야 한다.
 
 `MORAI_BRIDGE_CONFIG=/path/config.yaml ./launch.sh` 또는
 `./launch.sh config:=/path/config.yaml`로 다른 config를 선택할 수 있다.
@@ -141,7 +135,6 @@ respawn도 동작하지 않으므로 메인 `run.sh`는 `launch.sh` 프로세스
 - 프로젝트 커스텀 msg는 `interfaces`, MORAI 공식 msg는 service package `morai_msgs`만 사용한다.
 - 경로 추종, 속도 제어, 기어 판단은 넣지 않는다. `morai_msgs/CtrlCmd`에 gear 필드가 없으므로 wire gear는 상수 D=4로 고정한다.
 - 페달이 동시에 오면 브레이크를 남기고 accel을 0으로 만든다. 조향이 범위를 넘으면 그 방향 최대각으로 자른다. 둘 다 WARN을 남기고 UDP 송신은 계속한다.
-- `/diagnostics`는 1초마다 스트림별 `hz`와 `lifetime_p95_ms`를 붙인다. p95는 표본의 95%가 그 값 이하이며, 가장 오래 걸린 상위 5%의 경계값이다.
 
 ### 실행 객체와 책임
 
@@ -158,7 +151,7 @@ respawn도 동작하지 않으므로 메인 `run.sh`는 `launch.sh` 프로세스
 - `ControlCommandSanitizer`: TX 명령의 범위, brake 우선과 non-finite→0 대체를 한 번에 처리하고 변경 전후를 진단에 남긴다.
 - `CommandFreshnessGuard`: `command_timeout_sec`만 검사한다. fresh면 명령을 그대로 통과시키고 stale이면 `safe_brake_command=1.0`인 풀브레이크를 적용한다. 기어를 비롯한 주행 판단은 하지 않는다.
 - `MoraiControlEncoder`: 이미 선택된 제어값을 `ctrl_mode=2(Auto)`, `longlCmdType=1(Throttle)`, gear D=4, velocity=0, acceleration=0 상수와 함께 55바이트 MORAI 패킷으로 직렬화할 뿐 검증·clamp·fallback을 하지 않는다.
-- `DiagnosticsReporter`: 채널별 최신 상태, 카운터, 주기와 lifetime을 갱신한다. 처리 결과 직후 같은 RX/TX 경로에서 queue 1의 `/diagnostics/high_hz`를 publish하고, 1Hz timer에서는 `/diagnostics` snapshot을 publish한다.
+- `DiagnosticsReporter`: 채널별 최신 상태와 카운터를 갱신하고 처리 결과 직후 같은 RX/TX 경로에서 queue 1의 `/diagnostics/high_hz`를 publish한다. 별도 주기 snapshot과 rate/percentile 계산은 없다.
 
 ### 장애 격리
 
@@ -173,11 +166,12 @@ respawn도 동작하지 않으므로 메인 `run.sh`는 `launch.sh` 프로세스
 
 ### 진단 발행 정책
 
-- 1Hz `DiagnosticArray`는 사람이 `rostopic echo /diagnostics`로 보는 heartbeat다. 정상 상태에서도 채널별 `hz`, `lifetime_p95_ms`, 누적 오류 횟수와 마지막 오류 시각을 제공한다.
+- 1Hz `/diagnostics` heartbeat는 발행하지 않는다. rate/percentile 계산과 표본 이력 저장도 하지 않는다.
 - `/diagnostics/high_hz`는 고정 20Hz timer가 아니다. GPS/IMU/status의 논리 sample, 완성된 camera frame, TX send 결과, WARN/ERROR와 복구가 생길 때 해당 RX/TX 처리 경로가 반환하기 전에 lean status 하나를 즉시 발행한다.
-- RX high-hz `DiagnosticArray.header.stamp`는 해당 `receipt_time`, TX는 send-loop 시각이다. 계산이 필요한 `hz`, percentile, 장기 누적 통계는 비운다.
+- RX high-hz `DiagnosticArray.header.stamp`는 해당 `receipt_time`, TX는 send-loop 시각이다. `hz`, percentile은 계산하지 않는다. 현재 상태, 원본 metadata, 저비용 누적 counter는 포함한다.
 - camera chunk마다 `DiagnosticArray`를 발행하지 않는다. chunk 수신은 메모리 counter만 갱신하고 완성 frame 또는 오류에서 발행한다. JPEG chunk는 초당 수백~수천 datagram이 될 수 있어 매 `recvfrom()`마다 ROS 직렬화·할당을 하면 센서 경로에 불필요한 부하가 된다.
-- `/diagnostics`와 `/diagnostics/high_hz` 모두 표준 `diagnostic_msgs/DiagnosticArray`, publisher queue 1, non-latched다. 전자는 1Hz 전체 채널 snapshot, 후자는 즉시 발생한 채널 하나만 담는다.
+- `/diagnostics/high_hz`는 표준 `diagnostic_msgs/DiagnosticArray`, publisher queue 1, non-latched이며 해당 채널 하나만 담는다. 늦게 구독하면 과거 상태는 받지 못하고 다음 발행을 기다린다.
+- reporter의 공용 mutex는 상태 갱신과 직렬화/publish에 남는다. 제거 대상은 1Hz 전체 채널 통계 경로이며 lock 자체를 없애는 변경은 아니다.
 - `DiagnosticsReporter`의 `publish()` 호출 순서는 주 데이터 publish/send 결과와 동기화한다. ROS publisher queue는 1이므로 느린 subscriber를 기다리거나 진단 event를 무한히 쌓지 않는다.
 
 ## 합의된 설계 계약
@@ -191,15 +185,15 @@ respawn도 동작하지 않으므로 메인 `run.sh`는 `launch.sh` 프로세스
 - 단일 datagram 센서(GPS, IMU, status)는 socket backlog를 nonblocking으로 비운 뒤 newest-to-oldest 순서로 확인해 가장 최근의 structurally decodable datagram 하나만 처리한다. 건너뛴 datagram은 `superseded_count`로 기록한다.
 - 카메라는 chunk index로 한 JPEG frame만 재조립한다. 새 frame 시작, 조립 제한시간 초과, 잘못된 `max_chunks`, SOI/EOI 불일치 시 미완성 frame 전체를 버리고 부분 JPEG는 발행하지 않는다.
 - ROS 발행 queue는 실시간 센서 토픽에서 1로 두어 느린 subscriber 때문에 오래된 메시지가 쌓이지 않게 한다.
-- 센서 메시지 stamp는 payload 내부 시각이 아니라 해당 datagram/frame의 로컬 `receipt_time`이다. GPS GGA UTC는 `/diagnostics`의 `gga_utc` key로만 보존한다.
+- 센서 메시지 stamp는 payload 내부 시각이 아니라 해당 datagram/frame의 로컬 `receipt_time`이다. GPS GGA UTC는 `/diagnostics/high_hz`의 `gga_utc` key로만 보존한다.
 - stale RX 채널은 WARN/ERROR와 `/diagnostics/high_hz`로 알릴 뿐 마지막 센서값을 재발행하거나 값을 추정하지 않는다.
 - RX의 구조 검증은 header, byte length, tail/checksum처럼 필드 경계를 읽을 수 있는지만 판단한다. decode된 값은 0, 범위 밖, non-finite여도 바꾸거나 drop하지 않고 원본 발행과 WARN을 함께 수행한다.
 - 명세에 적힌 정확한 표현 변환(NMEA `ddmm.mmmm`→decimal degree)과 단위 변환 외에 좌표 변환, clamp, normalization, 보간, 추정을 하지 않는다.
 - TX 제어 입력은 `ControlCommandSanitizer`가 조향·페달 범위, brake 우선(`accel=0`), non-finite→0 대체를 한 분기에서 처리한 뒤에도 50Hz 송신을 계속한다. `longlCmdType`, velocity, acceleration 입력은 wire 출력에 사용하지 않으며 encoder가 항상 `ctrl_mode=2(Auto)`, `longlCmdType=1(Throttle)`, velocity=0, acceleration=0을 쓴다. 변경 전후 값을 WARN 로그와 `/diagnostics/high_hz`에 남긴다.
 - 제어 명령이 `command_timeout_sec`보다 오래되면 `CommandFreshnessGuard`가 설정된 safe brake를 선택한다. 진입과 복구를 WARN 로그와 `/diagnostics/high_hz`에 드러내며 기어는 변경하지 않는다.
 - `MoraiControlEncoder`는 선택된 명령의 직렬화만 하며 clamp, fallback, 주행 판단을 하지 않는다.
-- `/diagnostics`는 1Hz rich 전체 snapshot, `/diagnostics/high_hz`는 논리 sample·send 결과·상태 변화 직후 같은 처리 경로에서 발행하는 lean 단일 채널 상태다.
-- **코드에 존재하는 모든 runtime 검증·drop·대체·clamp·fallback·retry·socket reopen 분기는 시퀀스 다이어그램에 객체, 조건, 결과 화살표로 드러나야 한다. 다이어그램에 없는 방어 코드는 구현하지 않는다. 구현 중 새 분기가 필요하면 코드를 쓰기 전에 README와 HTML 다이어그램을 먼저 수정해 사용자 확인을 받는다.**
+- `/diagnostics/high_hz`만 논리 sample·send 결과·상태 변화 직후 같은 처리 경로에서 발행한다. 주기 heartbeat는 없다.
+- **코드에 존재하는 모든 runtime 검증·drop·대체·clamp·fallback·retry·socket reopen 분기는 시퀀스 다이어그램에 객체, 조건, 결과 화살표로 드러나야 한다. 다이어그램에 없는 방어 코드는 구현하지 않는다. 구현 중 새 분기가 필요하면 코드를 쓰기 전에 README의 다이어그램을 먼저 수정해 사용자 확인을 받는다. README가 최고 권위이며 HTML viewer는 계약의 기준이 아니다.**
 
 ## 잠정 확정 시퀀스
 
@@ -233,7 +227,6 @@ sequenceDiagram
     participant Reporter as DiagnosticsReporter
     participant Topic as channel ROS topic
     participant HighHzTopic as /diagnostics/high_hz
-    participant DiagTopic as /diagnostics
 
     Note over Worker,Bridge: camera front :9291, left :9293, right :9295 are fully independent<br/>GPS :9301, IMU :9303, status :9094
     Config->>ConfigValidator: validate RX port, topic, frame/calibration
@@ -244,7 +237,7 @@ sequenceDiagram
         ConfigValidator-->>Worker: construct and start this channel
     end
     loop each port worker, independent of every other port and TX
-        loop drain kernel receive buffer
+        loop drain until EAGAIN or camera batch reaches 16 packets
             Worker->>Socket: recvfrom()
             Socket-->>Worker: datagram, sender, receipt_time
             Worker->>SourceFilter: accept(sender, allowed_source_ip)
@@ -253,9 +246,14 @@ sequenceDiagram
                 Reporter->>HighHzTopic: publishHighHz(SOURCE_REJECTED, receipt_time)
             else sender accepted
                 SourceFilter-->>Worker: append datagram to channel batch
+                opt camera batch size reaches 16
+                    Worker->>Worker: end drain, process entire batch in arrival order (no drop)
+                end
             end
         end
-        Socket-->>Worker: EAGAIN = queue empty, normal drain end
+        opt drain ended because socket is empty
+            Socket-->>Worker: EAGAIN = queue empty, normal drain end
+        end
 
         alt channel processing throws std::exception except bad_alloc
             Worker->>Reporter: error(WORKER_EXCEPTION, details)
@@ -294,6 +292,17 @@ sequenceDiagram
                         Reporter->>HighHzTopic: publishHighHz(VALUE_ANOMALY, receipt_time)
                     end
                     Parser->>Assembler: add(raw chunk, receipt_time)
+                    opt active frame and steady receipt_time - first_receipt exceeds 200ms
+                        Assembler->>Assembler: reset(), drop previous frame (ASSEMBLY_TIMEOUT)
+                    end
+                    opt still active, both timestamp keys exist, incoming key differs
+                        Assembler->>Assembler: reset(), drop previous frame (NEW_FRAME)
+                    end
+                    Assembler->>Assembler: start frame if inactive, process current chunk
+                    opt add returns ASSEMBLY_TIMEOUT or NEW_FRAME drop_reason
+                        Bridge->>Reporter: dropped(channel, drop_reason, receipt_time)
+                        Reporter->>HighHzTopic: publishHighHz(FRAME_DROPPED, receipt_time)
+                    end
                     alt incomplete frame
                         Assembler->>Reporter: recordChunk(), no ROS publish
                     else resource limit or invalid JPEG structure
@@ -303,7 +312,7 @@ sequenceDiagram
                         Assembler->>Bridge: complete frame, first receipt_time
                         Bridge->>Bridge: translateToRosMessage(frame, receipt_time)
                         Bridge->>Topic: publish(translated_msg)
-                        Bridge->>Reporter: recordPublished(channel, lifetime)
+                        Bridge->>Reporter: recordPublished(channel)
                         Reporter->>HighHzTopic: publishHighHz(PUBLISHED, receipt_time)
                     end
                 end
@@ -313,6 +322,11 @@ sequenceDiagram
             loop newest to oldest until target decode succeeds or batch ends
                 Selector->>Parser: decodeStructure(candidate)
                 Parser-->>Selector: decoded target, NON_TARGET, or STRUCTURAL_ERROR
+            end
+            Selector->>Reporter: recordSelection(channel, rejected count, non_target count)
+            opt target selected and rejected count greater than zero
+                Selector->>Reporter: parseError(batch rejected count, increment=0)
+                Reporter->>HighHzTopic: publishHighHz(STRUCTURAL_ERROR, batch receipt_time)
             end
             alt GPS batch has only non-GGA NMEA
                 Selector->>Reporter: recordIgnored(NON_GGA), no ROS publish
@@ -330,7 +344,7 @@ sequenceDiagram
                 Inspector->>Bridge: decoded raw unchanged
                 Bridge->>Bridge: translateToRosMessage(decoded, receipt_time)
                 Bridge->>Topic: publish(translated_msg)
-                Bridge->>Reporter: recordPublished(channel, lifetime)
+                Bridge->>Reporter: recordPublished(channel)
                 Reporter->>HighHzTopic: publishHighHz(PUBLISHED, receipt_time)
             end
         end
@@ -346,10 +360,6 @@ sequenceDiagram
         end
     end
 
-    loop every 1 second
-        Reporter->>Reporter: snapshotAllChannels()
-        Reporter->>DiagTopic: publishRichDiagnostics(snapshot)
-    end
 ```
 
 #### RX 객체와 메서드
@@ -365,7 +375,7 @@ sequenceDiagram
 | `RxValueInspector` | `inspect(raw)` | 0, non-finite, enum 범위, quaternion norm 등을 진단하지만 값을 바꾸거나 publish를 막지 않는다. |
 | 각 `Bridge` | `translateToRosMessage(decoded, receipt_time)`, `publish()` | 문서화된 표현·단위 변환만 수행하고 ROS message를 만든다. 좌표 회전, clamp, normalization, 추정은 하지 않는다. |
 | `ChannelFreshnessMonitor` | `check(now, last_publish)` | stale 상태와 복구만 판정한다. 센서값을 재발행하지 않는다. |
-| `DiagnosticsReporter` | `warnAndPublishHighHz()`, `recordPublishedAndPublishHighHz()`, `publishRichDiagnostics()` | 처리 결과를 갱신한 직후 같은 RX 실행 경로에서 `/diagnostics/high_hz`를 publish하고 반환한다. 1Hz rich snapshot만 timer에서 별도로 발행한다. |
+| `DiagnosticsReporter` | `warnAndPublishHighHz()`, `recordPublishedAndPublishHighHz()` | 처리 결과를 갱신한 직후 같은 RX 실행 경로에서 `/diagnostics/high_hz`를 publish하고 반환한다. 주기 snapshot은 발행하지 않는다. |
 
 ### TX
 
@@ -388,7 +398,6 @@ sequenceDiagram
     participant LampSender as UdpSender (configured Lamp Control port)
     participant Reporter as DiagnosticsReporter
     participant HighHzTopic as /diagnostics/high_hz
-    participant DiagTopic as /diagnostics
     participant Timer as send_timer_ 50Hz
 
     Config->>ConfigValidator: validate TX destination, rate, safe brake
@@ -436,7 +445,7 @@ sequenceDiagram
             end
         else sent
             Sender-->>Tx: bytes sent
-            Tx->>Reporter: recordSent(lifetime)
+            Tx->>Reporter: recordSent()
         end
         Reporter->>HighHzTopic: publishHighHz(TX result, send-loop time)
     end
@@ -469,10 +478,6 @@ sequenceDiagram
         Reporter->>HighHzTopic: publishHighHz(lamp TX result, send time)
     end
 
-    loop every 1 second
-        Reporter->>Reporter: snapshotAllChannels()
-        Reporter->>DiagTopic: publishRichDiagnostics(snapshot)
-    end
 ```
 
 #### TX 객체와 메서드
@@ -487,7 +492,7 @@ sequenceDiagram
 | `LampCommandSanitizer` | `sanitize(lamps)` | 잘못된 `turnSignal` 또는 `emergencySignal` 필드만 `0=off`로 바꾸고 WARN을 남긴다. 잘못된 입력으로 비상등을 임의 점등하지 않는다. |
 | `MoraiLampEncoder` | `encode(lamps)` | sanitize된 값을 33-byte packet으로 직렬화한다. |
 | `TxSocketRecoveryPolicy` | `classify(errno, count)` | 일시·network 오류는 socket을 유지하고, socket-local fatal 오류나 설정된 연속 오류에서만 해당 sender를 reopen한다. control sender와 lamp sender 상태는 독립이다. |
-| `DiagnosticsReporter` | `warnAndPublishHighHz()`, `recordSentAndPublishHighHz()`, `publishRichDiagnostics()` | command 처리와 UDP send 결과 직후 같은 TX 실행 경로에서 high-hz 진단을 publish한다. |
+| `DiagnosticsReporter` | `warnAndPublishHighHz()`, `recordSentAndPublishHighHz()` | command 처리와 UDP send 결과 직후 같은 TX 실행 경로에서 high-hz 진단을 publish한다. |
 
 주석용 브라우저 뷰어: [`docs/udp-bridge-sequence.html`](docs/udp-bridge-sequence.html)
 
@@ -539,7 +544,7 @@ sequenceDiagram
 - socket은 nonblocking으로 읽으며 `SO_RCVBUF`는 `receive_buffer_bytes` 기본값
   4MiB를 요청한다. 이것은 애플리케이션 FIFO가 아니라 worker가 CPU를 쓰는 동안
   kernel이 UDP datagram을 잠시 보관하는 용량이다. 실제 적용값은 시작 로그와
-  `/diagnostics`에 기록한다.
+  `/diagnostics/high_hz`에 기록한다.
 - `allowed_source_ip`가 비어 있지 않으면 sender IP가 다른 datagram은 decode 전에
   버리고 `rejected_source`를 증가시킨다. 시뮬레이터 외 호스트가 같은 포트로 보낸
   packet을 차단하는 선택적 source filter이며, 빈 문자열이면 모든 sender를 허용한다.
@@ -547,13 +552,16 @@ sequenceDiagram
   가장 최신 structurally decodable sample 하나만 publish한다. 더 오래된 sample은
   `superseded`로 센다. 마지막 datagram의 구조가 깨졌다면 한 칸씩 과거로 가서 가장
   가까운 structurally decodable packet을 찾는다.
-- selection과 publish는 반드시 `EAGAIN`을 확인한 뒤 수행한다. 따라서 publish 이후
+- GPS/IMU/status selection과 publish는 반드시 `EAGAIN`을 확인한 뒤 수행한다. 따라서 publish 이후
   kernel에 남아 다음 callback에서 읽히는 packet은 그 publish보다 나중에 도착한
   packet뿐이다. publish 뒤에 추가 drain을 하여 새 packet을 버리지 않는다.
 - `EAGAIN`은 "지금 kernel receive buffer에 더 읽을 datagram이 없다"는 뜻이다.
   batch drain의 정상 끝이며 오류, timeout, packet loss로 세지 않는다.
 - 카메라는 chunk 연속성이 필요하므로 읽은 datagram을 도착 순서대로 모두 assembler에
-  넘긴다. 애플리케이션 레벨 camera packet queue는 별도로 만들지 않는다.
+  넘긴다. camera 수신 batch는 채널당 최대 16 datagram(최대 약 1MiB)이다.
+  16개 또는 EAGAIN에 도달하면 batch 전체를 순서대로 처리하고 비운 뒤 수신을 재개한다.
+  batch가 찼다는 이유로 chunk를 버리지 않는다. 별도 producer/consumer queue는 없다.
+  처리 중 새 datagram은 기존 kernel receive buffer에서 기다리며 buffer 포화 시 UDP 유실은 가능하다.
 - bind 실패는 해당 채널만 100ms에서 최대 2s bounded backoff로 재시도한다. recv는
   `EINTR`이면 즉시 재호출하고, 기타 일시 오류 한 번에는 기존 socket을 유지한다.
   `recv_error_reopen_threshold` 연속 오류 또는 fatal descriptor 오류에서만 해당
@@ -576,7 +584,6 @@ ROS1에는 ROS2/DDS의 QoS profile이 없으므로 여기서 QoS는 queue, latch
 | 카메라 image / camera_info | 1 | false | `/compressed`와 `/camera_info`를 frame마다 함께 발행하며 같은 stamp와 frame_id 사용 |
 | GPS / IMU / vehicle status | 1 | false | 최신 structurally decoded sample만 유지, stale 값 재발행 금지 |
 | control/lamp command subscriber | 1 | 해당 없음 | 기본 TCPROS + `tcpNoDelay`, callback 수신 시 최신 명령을 덮어씀 |
-| `/diagnostics` | 1 | false | 1Hz rich heartbeat, 느린 subscriber 때문에 RX/TX를 막지 않음 |
 | `/diagnostics/high_hz` | 1 | false | 논리 sample/send/상태 변화 직후 동기 호출, 이전 상태 메시지를 쌓지 않음 |
 
 ROS1 `roscpp` subscriber는 `TransportHints().udp()`로 UDPROS를 요청할 수 있지만 이는
@@ -587,24 +594,24 @@ subscriber 쪽 선호이며 publisher 전체를 "UDP 토픽"으로 선언하는 
 
 ### 포트와 토픽 인덱스
 
+RX 발행에는 rate 상한이 없다. 수신과 조립 완료에 따라 발행하며 TX 제어는 50Hz를 유지한다.
 실제 포트는 MORAI SIM의 Network Settings / Ego Network에서 채널별로 설정한다.
 이 표의 값과 [`config/config.yaml`](config/config.yaml)이 이 패키지의 기본값이다.
 
-| 방향 | MORAI 채널 | UDP 포트 | ROS 토픽 | ROS 타입 | 기본 rate 상한 |
-| --- | --- | ---: | --- | --- | ---: |
-| RX | Camera front | 9291 | `/image/front/compressed` | `sensor_msgs/CompressedImage` | 30Hz |
-| RX | Camera front info | 9291과 같은 frame | `/image/front/camera_info` | `sensor_msgs/CameraInfo` | image와 동일 |
-| RX | Camera left | 9293 | `/image/left/compressed` | `sensor_msgs/CompressedImage` | 30Hz |
-| RX | Camera left info | 9293과 같은 frame | `/image/left/camera_info` | `sensor_msgs/CameraInfo` | image와 동일 |
-| RX | Camera right | 9295 | `/image/right/compressed` | `sensor_msgs/CompressedImage` | 30Hz |
-| RX | Camera right info | 9295와 같은 frame | `/image/right/camera_info` | `sensor_msgs/CameraInfo` | image와 동일 |
-| RX | GPS | 9301 | `/sensors/gps/fix` | `sensor_msgs/NavSatFix` | 30Hz |
-| RX | IMU | 9303 | `/sensors/imu/data` | `sensor_msgs/Imu` | 50Hz |
-| RX | Competition Vehicle Status | 9094 | `/vehicle/competition_status` | `interfaces/CompetitionVehicleStatus` | 50Hz |
-| TX | Ego Ctrl Cmd | 9093 | `/morai_udp_bridge/control_cmd`에서 입력 | `morai_msgs/CtrlCmd` | 50Hz send |
-| TX | Turn Signal Lamp Control | MORAI Network Settings에서 지정 | `/morai_udp_bridge/lamp_cmd`에서 입력 | `morai_msgs/Lamps` | command 발생 시 |
-| 내부 | 진단 rich | 해당 없음 | `/diagnostics` | `diagnostic_msgs/DiagnosticArray` | 1Hz |
-| 내부 | 진단 high-rate | 해당 없음 | `/diagnostics/high_hz` | `diagnostic_msgs/DiagnosticArray` | 논리 처리마다 즉시 |
+| 방향 | MORAI 채널 | UDP 포트 | ROS 토픽 | ROS 타입 |
+| --- | --- | ---: | --- | --- |
+| RX | Camera front | 9291 | `/image/front/compressed` | `sensor_msgs/CompressedImage` |
+| RX | Camera front info | 9291과 같은 frame | `/image/front/camera_info` | `sensor_msgs/CameraInfo` |
+| RX | Camera left | 9293 | `/image/left/compressed` | `sensor_msgs/CompressedImage` |
+| RX | Camera left info | 9293과 같은 frame | `/image/left/camera_info` | `sensor_msgs/CameraInfo` |
+| RX | Camera right | 9295 | `/image/right/compressed` | `sensor_msgs/CompressedImage` |
+| RX | Camera right info | 9295와 같은 frame | `/image/right/camera_info` | `sensor_msgs/CameraInfo` |
+| RX | GPS | 9301 | `/sensors/gps/fix` | `sensor_msgs/NavSatFix` |
+| RX | IMU | 9303 | `/sensors/imu/data` | `sensor_msgs/Imu` |
+| RX | Competition Vehicle Status | 9094 | `/vehicle/competition_status` | `interfaces/CompetitionVehicleStatus` |
+| TX | Ego Ctrl Cmd | 9093 | `/morai_udp_bridge/control_cmd`에서 입력 | `morai_msgs/CtrlCmd` |
+| TX | Turn Signal Lamp Control | MORAI Network Settings에서 지정 | `/morai_udp_bridge/lamp_cmd`에서 입력 | `morai_msgs/Lamps` |
+| 내부 | 진단 high-rate | 해당 없음 | `/diagnostics/high_hz` | `diagnostic_msgs/DiagnosticArray` |
 
 ### MORAI 좌표계와 각도 기준
 
@@ -746,7 +753,7 @@ quality가 0인 structurally decodable GGA도 버리지 않고 `STATUS_NO_FIX` �
 
 `quality=0/양수`를 `NO_FIX/FIX`로 축약하는 것만으로 현재 controller의 사용 가능
 여부 판단에는 충분하지만 RTK/DGPS 종류까지 구분하기에는 부족하다. 그래서 원본
-GGA `quality`, `satellites`, `hdop`를 `/diagnostics`와 `/diagnostics/high_hz`에 함께
+GGA `quality`, `satellites`, `hdop`를 `/diagnostics/high_hz`에 함께
 보존한다. 근거 없이 `SBAS_FIX`나 `GBAS_FIX`로 추정하지 않는다.
 
 ### IMU packet ↔ Imu
@@ -985,33 +992,32 @@ MORAI Network Settings에서 Lamp Control destination port를 지정했을 때�
 
 ### 내부 상태 ↔ diagnostics 토픽
 
-diagnostics는 MORAI packet과 짝이 없는 내부 관측 결과다. 여기서 "두 토픽"은
-1Hz rich `/diagnostics`와 즉시 lean `/diagnostics/high_hz`를 뜻한다.
+diagnostics는 MORAI packet과 짝이 없는 내부 관측 결과다.
 `DiagnosticsReporter`는 주 데이터 publish 또는 UDP send 결과를 기록한 직후 같은
-실행 경로에서 `/diagnostics/high_hz`를 publish하고 반환한다. 따라서 main result와
-진단 호출 순서는 대응하지만, 진단 subscriber의 처리 완료를 기다리지는 않는다.
-1Hz timer는 같은 객체의 snapshot으로 `/diagnostics`를 별도 발행한다.
+실행 경로에서 `/diagnostics/high_hz`를 publish하고 반환한다. subscriber의 처리 완료는
+기다리지 않는다. 1Hz `/diagnostics`와 rate/percentile 계산은 제거한다.
 
-두 토픽의 각 `DiagnosticStatus.name`은 `morai_udp_bridge/<channel>`,
-`hardware_id`는 `udp:<port>` 형식이다. `level`은 현재 `OK/WARN/ERROR`, `message`는
-현재 reason이며 `DiagnosticArray.header.stamp`는 발행 시각이다.
+각 `DiagnosticStatus.name`은 `morai_udp_bridge/<channel>`,
+`hardware_id`는 `udp:<port>`다. `level`은 현재 `OK/WARN/ERROR`,
+`message`는 reason이다. RX stamp는 해당 receipt_time, TX는 처리 시각이다.
 
-`/diagnostics` 1Hz rich status의 `KeyValue`:
+단일 채널 status의 `KeyValue`:
+- 공통: `direction`, `channel`, `port`, `topic`, `error_code`, `receipt_time`,
+  `state_since`, `last_error_time`, `last_transition_time`.
+- 누적 counter: `received`, `published`, `rejected_source`, `parse_error`,
+  `superseded`, `dropped`, `sent`, `send_error`, `sanitized`, `stale_fallback`.
+- RX는 `stale_age_ms`, TX는 `command_age_ms`.
+- socket buffer: `requested_receive_buffer_bytes`, `actual_receive_buffer_bytes`.
+- GPS metadata: `gga_utc`, `quality`, `satellites`, `hdop`, `non_gga`.
+- source timestamp가 있는 채널: `last_source_sec`, `last_source_nsec`.
+- 카메라: `chunks`, `completed_frames`, `dropped_frames`, `invalid_frames`, `parse_error_count`.
+- sanitize 발생 시 원본/적용값과 사유 등 기존 부가 metadata.
 
-- 공통: `direction`, `channel`, `port`, `topic`, `state_since`, `last_error_time`.
-- 수신: `received`, `published`, `rejected_source`, `parse_error`, `superseded`,
-  `dropped`, `stale_age_ms`, `hz`, `lifetime_p95_ms`.
-- 송신: `command_age_ms`, `sent`, `send_error`, `sanitized`, `stale_fallback`,
-  `hz`, `lifetime_p95_ms`.
-- GPS 추가: `gga_utc`, `quality`, `satellites`, `hdop`, `non_gga`.
-- 카메라 추가: `chunks`, `completed_frames`, `dropped_frames`, `invalid_frames`.
-
-`/diagnostics/high_hz` lean status에는 `channel`, `port`, `error_code`,
-`last_transition_time`, `receipt_time`과 현재 상태 판단에 필요한 `stale_age_ms` 또는
-`command_age_ms`만 넣는다. source timestamp가 있는 채널은 `last_source_sec`,
-`last_source_nsec`도 넣는다. percentile과 rate 계산은 하지 않는다. 논리 sample,
-send 결과, 오류와 복구가 생기면 해당 채널 status 하나를 같은 처리 경로에서 즉시 발행한다.
-camera 성공은 chunk마다가 아니라 완성 frame마다 발행한다.
+논리 sample, send 결과, 오류와 복구에 발행한다. camera 성공은 chunk마다가 아니라
+완성 frame마다 발행한다. 패키지 자체는 별도 health 색상이나 RED↔GREEN 로그를 만들지 않는다.
+상태 해석은 `/diagnostics/high_hz`를 구독하는 외부 노드의 책임이다.
+non-latched이므로 구독 전 발생한 CONFIG_ERROR 등 단발 상태는 재전달되지 않는다.
+RX stale 감시는 별도 timer로 유지하며 무수신만으로 socket을 reopen하지 않는다.
 
 ## Wire 참고 자료
 
@@ -1031,9 +1037,9 @@ camera 성공은 chunk마다가 아니라 완성 frame마다 발행한다.
 - GGA: 시각, 위도·경도, fix 품질, 위성 수, HDOP, 고도를 담는 NMEA 문장이다. 현재 `/sensors/gps/fix`의 위치 fix 원본으로 사용한다.
 - RMC: 시각·날짜, 위도·경도, 지상 속도와 진행방향을 담는 최소 항법 문장이다. 버리면 GPS 기반 속도·heading은 제공하지 못한다.
 - GSA: 2D/3D fix 모드, 사용 위성, PDOP/HDOP/VDOP를 담는다. 버리면 DOP 기반 정확도·covariance를 만들 수 없다.
-- 현재 GPS 정책: GGA만 발행하고 RMC/GSA는 `NON_GGA`로 집계한다. 현재 controller의 속도는 competition status, 자세·방향은 IMU/localization이 제공하므로 RMC 속도·course는 중복이다. GGA의 fix quality, 위성 수, HDOP로 GPS 음영 진입과 수평 품질 저하는 감지한다. GGA UTC는 `/diagnostics`의 `gga_utc` key로 보존하고 ROS stamp는 수신 `receipt_time`을 쓴다.
+- 현재 GPS 정책: GGA만 발행하고 RMC/GSA는 `NON_GGA`로 집계한다. 현재 controller의 속도는 competition status, 자세·방향은 IMU/localization이 제공하므로 RMC 속도·course는 중복이다. GGA의 fix quality, 위성 수, HDOP로 GPS 음영 진입과 수평 품질 저하는 감지한다. GGA UTC는 `/diagnostics/high_hz`의 `gga_utc` key로 보존하고 ROS stamp는 수신 `receipt_time`을 쓴다.
 - `NavSatFix.position_covariance`: ENU 축 위치 오차의 분산·공분산을 m² 단위 3x3 행렬로 담는 필드다. GGA의 HDOP만으로 3축 covariance를 정확히 만들 수 없으므로 임의 수치를 만들지 않고 `COVARIANCE_TYPE_UNKNOWN`을 사용한다. 시뮬레이터가 신뢰할 수 있는 오차 모델이나 GSA 기반 계약을 제공할 때만 채운다.
-- `DiagnosticsReporter`: 로그와 통계를 갱신하고, 처리 결과 직후 같은 callback/worker에서 lean `/diagnostics/high_hz`를 publish한다. 1Hz timer에서는 rich `/diagnostics` snapshot을 발행한다.
+- `DiagnosticsReporter`: 로그와 통계를 갱신하고, 처리 결과 직후 같은 callback/worker에서 lean `/diagnostics/high_hz`를 publish한다. 주기 snapshot과 rate/percentile 계산은 없다.
 - `CommandFreshnessGuard`: `select(latest, age)`가 age < `command_timeout_sec`이면 마지막 명령, 아니면 설정된 `safe_brake_command`를 고른다. fallback 진입·복구는 WARN 로그와 `/diagnostics/high_hz`로 노출하며 기어는 건드리지 않는다.
 - sanitize: normalized steering `[-1,1]`, pedal 범위와 충돌, non-finite를 한 번에 처리한다. non-finite는 0, 페달 동시면 brake를 남기고 accel=0으로 하며 UDP 송신은 끊지 않는다.
 - MoraiControlEncoder: 고른 명령을 ctrl_mode=2(Auto), longlCmdType=1(Throttle), gear D=4, velocity=0, acceleration=0 상수와 함께 55바이트 Ego Ctrl Cmd 패킷으로 묶는 객체.

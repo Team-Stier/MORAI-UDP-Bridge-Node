@@ -64,13 +64,8 @@ bool ChannelFreshnessMonitor::check(double age_seconds, double timeout) {
 }
 
 DiagnosticsReporter::DiagnosticsReporter(ros::NodeHandle node,
-                                         const std::string& rich_topic,
-                                         const std::string& high_hz_topic,
-                                         double period) {
-  rich_publisher_ = node.advertise<diagnostic_msgs::DiagnosticArray>(rich_topic, 1, false);
+                                         const std::string& high_hz_topic) {
   high_hz_publisher_ = node.advertise<diagnostic_msgs::DiagnosticArray>(high_hz_topic, 1, false);
-  rich_timer_ = node.createWallTimer(ros::WallDuration(period),
-                                     &DiagnosticsReporter::publishRich, this);
 }
 
 void DiagnosticsReporter::addChannel(const std::string& name,
@@ -110,15 +105,6 @@ void DiagnosticsReporter::transition(ChannelSnapshot& item, int level,
   if (level != diagnostic_msgs::DiagnosticStatus::OK) item.last_error_time = stamp;
 }
 
-void DiagnosticsReporter::recordLifetime(ChannelSnapshot& item,
-                                          SteadyClock::time_point started) {
-  const auto now = SteadyClock::now();
-  item.event_times.push_back(now);
-  item.lifetimes_ms.push_back(std::chrono::duration<double, std::milli>(now - started).count());
-  if (item.event_times.size() > 512U) item.event_times.erase(item.event_times.begin());
-  if (item.lifetimes_ms.size() > 512U) item.lifetimes_ms.erase(item.lifetimes_ms.begin());
-}
-
 void DiagnosticsReporter::setSocketBuffer(const std::string& name,
                                           std::size_t requested,
                                           std::size_t actual) {
@@ -146,10 +132,10 @@ void DiagnosticsReporter::rejected(const std::string& name, const Datagram& data
 
 void DiagnosticsReporter::parseError(const std::string& name,
                                      const std::string& detail,
-                                     const ros::Time& stamp) {
+                                     const ros::Time& stamp, std::size_t count) {
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
-  ++item.parse_error;
+  item.parse_error += count;
   transition(item, diagnostic_msgs::DiagnosticStatus::WARN, "STRUCTURAL_ERROR", detail, stamp);
   ROS_WARN_STREAM_THROTTLE(1.0, name << ": STRUCTURAL_ERROR: " << detail);
   publishHighHzLocked(item, stamp);
@@ -196,12 +182,12 @@ void DiagnosticsReporter::socketError(const std::string& name,
 }
 
 void DiagnosticsReporter::ignored(const std::string& name, const std::string& code,
-                                  const ros::Time& stamp) {
+                                  const ros::Time& stamp, std::size_t increment) {
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
   const auto found = item.extra.find("non_gga");
   const std::uint64_t count = found == item.extra.end() ? 0U : std::stoull(found->second);
-  item.extra["non_gga"] = text(count + 1U);
+  item.extra["non_gga"] = text(count + increment);
   transition(item, item.level, code, "normal non-target packet", stamp);
   publishHighHzLocked(item, stamp);
 }
@@ -209,6 +195,18 @@ void DiagnosticsReporter::ignored(const std::string& name, const std::string& co
 void DiagnosticsReporter::superseded(const std::string& name, std::size_t count) {
   std::lock_guard<std::mutex> lock(mutex_);
   channel(name).superseded += count;
+}
+
+void DiagnosticsReporter::recordSelection(const std::string& name,
+                                           std::size_t rejected,
+                                           std::size_t non_target) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto& item = channel(name);
+  item.parse_error += rejected;
+  if (name == "gps") {
+    auto& count = item.extra["non_gga"];
+    count = text((count.empty() ? 0U : std::stoull(count)) + non_target);
+  }
 }
 
 void DiagnosticsReporter::dropped(const std::string& name,
@@ -226,7 +224,7 @@ void DiagnosticsReporter::dropped(const std::string& name,
 
 void DiagnosticsReporter::published(const std::string& name,
                                     const ros::Time& stamp,
-                                    SteadyClock::time_point receipt,
+                                    SteadyClock::time_point,
                                     double source_sec,
                                     double source_nsec) {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -240,7 +238,6 @@ void DiagnosticsReporter::published(const std::string& name,
   item.source_nsec = source_nsec;
   item.has_logical_publish = true;
   item.last_logical_publish = SteadyClock::now();
-  recordLifetime(item, receipt);
   if (recovering) {
     transition(item, diagnostic_msgs::DiagnosticStatus::OK, "OK_RECOVERY", "new sensor sample", stamp);
     publishHighHzLocked(item, stamp);
@@ -281,11 +278,10 @@ void DiagnosticsReporter::commandAccepted(bool sanitized, const ros::Time& stamp
 }
 
 void DiagnosticsReporter::sent(const std::string& name, const ros::Time& stamp,
-                               SteadyClock::time_point started) {
+                               SteadyClock::time_point) {
   std::lock_guard<std::mutex> lock(mutex_);
   ChannelSnapshot& item = channel(name);
   ++item.sent;
-  recordLifetime(item, started);
   if (item.stale_command) {
     transition(item, diagnostic_msgs::DiagnosticStatus::WARN, "STALE_COMMAND",
                "stale command, safe brake selected", stamp);
@@ -369,7 +365,7 @@ void DiagnosticsReporter::checkStale() {
 }
 
 diagnostic_msgs::DiagnosticStatus DiagnosticsReporter::statusLocked(
-    const ChannelSnapshot& item, bool rich) const {
+    const ChannelSnapshot& item) const {
   diagnostic_msgs::DiagnosticStatus status;
   status.name = "morai_udp_bridge/" + item.name;
   status.hardware_id = "udp:" + text(item.port);
@@ -395,10 +391,8 @@ diagnostic_msgs::DiagnosticStatus DiagnosticsReporter::statusLocked(
     status.values.push_back(value("last_source_nsec", text(item.source_nsec)));
   }
   for (const auto& extra : item.extra) {
-    if (rich || (extra.first != "non_gga" && extra.first != "gga_utc"))
-      status.values.push_back(value(extra.first, extra.second));
+    status.values.push_back(value(extra.first, extra.second));
   }
-  if (!rich) return status;
 
   status.values.push_back(value("state_since", decimal(item.state_since.toSec())));
   status.values.push_back(value("last_error_time", decimal(item.last_error_time.toSec())));
@@ -408,29 +402,12 @@ diagnostic_msgs::DiagnosticStatus DiagnosticsReporter::statusLocked(
         value("dropped_frames", text(item.dropped_frames)), value("invalid_frames", text(item.invalid_frames)),
         value("parse_error_count", text(item.parse_error))});
   }
-  std::size_t recent = 0U;
-  SteadyClock::time_point first;
-  for (const auto& event : item.event_times) {
-    if (std::chrono::duration<double>(now - event).count() <= 5.0) {
-      if (recent == 0U) first = event;
-      ++recent;
-    }
-  }
-  double hz = 0.0;
-  if (recent > 1U) hz = (recent - 1U) / std::chrono::duration<double>(item.event_times.back() - first).count();
-  double p95 = 0.0;
-  if (!item.lifetimes_ms.empty()) {
-    std::vector<double> sorted = item.lifetimes_ms;
-    std::sort(sorted.begin(), sorted.end());
-    p95 = sorted[static_cast<std::size_t>(std::ceil(sorted.size() * 0.95)) - 1U];
-  }
   status.values.insert(status.values.end(), {
       value("received", text(item.received)), value("published", text(item.published)),
       value("rejected_source", text(item.rejected_source)), value("parse_error", text(item.parse_error)),
       value("superseded", text(item.superseded)), value("dropped", text(item.dropped)),
       value("sent", text(item.sent)), value("send_error", text(item.send_error)),
       value("sanitized", text(item.sanitized)), value("stale_fallback", text(item.stale_fallback)),
-      value("hz", decimal(hz)), value("lifetime_p95_ms", decimal(p95)),
       value("requested_receive_buffer_bytes", text(item.requested_buffer)),
       value("actual_receive_buffer_bytes", text(item.actual_buffer))});
   return status;
@@ -440,17 +417,8 @@ void DiagnosticsReporter::publishHighHzLocked(ChannelSnapshot& item,
                                               const ros::Time& stamp) {
   diagnostic_msgs::DiagnosticArray array;
   array.header.stamp = stamp;
-  array.status.push_back(statusLocked(item, false));
+  array.status.push_back(statusLocked(item));
   high_hz_publisher_.publish(array);
-}
-
-void DiagnosticsReporter::publishRich(const ros::WallTimerEvent&) {
-  checkStale();
-  diagnostic_msgs::DiagnosticArray array;
-  array.header.stamp = ros::Time::now();
-  std::lock_guard<std::mutex> lock(mutex_);
-  for (const auto& entry : channels_) array.status.push_back(statusLocked(entry.second, true));
-  rich_publisher_.publish(array);
 }
 
 SocketAction SocketRecoveryPolicy::classify(int error,
@@ -556,6 +524,7 @@ bool UdpRxWorker::drainBatch(std::array<std::uint8_t, 65535U>& buffer) {
       reporter_->received(name_, datagram);
       if (UdpSourceFilter::accept(datagram.sender, allowed_source_ip_)) {
         batch_.push_back(std::move(datagram));
+        if (name_.compare(0, 7, "camera_") == 0 && batch_.size() >= 16U) return true;
       } else {
         reporter_->rejected(name_, datagram);
       }

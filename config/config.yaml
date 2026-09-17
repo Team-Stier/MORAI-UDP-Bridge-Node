@@ -16,8 +16,6 @@ bind_ip: 0.0.0.0
 allowed_source_ip: ""
 receive_buffer_bytes: 4194304
 recv_error_reopen_threshold: 3
-diagnostics_period: 1.0
-diagnostics_topic: /diagnostics
 high_hz_diagnostics_topic: /diagnostics/high_hz
 
 cameras:
@@ -27,28 +25,24 @@ cameras:
     topic: /image/front/compressed
     camera_info_topic: /image/front/camera_info
     stale_timeout: 0.5
-    max_hz: 30.0
   left:
     port: 9293
     packet_layout: timestamped
     topic: /image/left/compressed
     camera_info_topic: /image/left/camera_info
     stale_timeout: 0.5
-    max_hz: 30.0
   right:
     port: 9295
     packet_layout: timestamped
     topic: /image/right/compressed
     camera_info_topic: /image/right/camera_info
     stale_timeout: 0.5
-    max_hz: 30.0
 
 gps:
   enabled: true
   port: 9301
   topic: /sensors/gps/fix
   stale_timeout: 1.0
-  max_hz: 30.0
 
 imu:
   enabled: true
@@ -56,14 +50,12 @@ imu:
   packet_layout: timestamped
   topic: /sensors/imu/data
   stale_timeout: 0.5
-  max_hz: 50.0
 
 status:
   enabled: true
   port: 909
   topic: /vehicle/competition_status
   stale_timeout: 0.25
-  max_hz: 50.0
 
 control:
   command_topic: /morai_udp_bridge/control_cmd

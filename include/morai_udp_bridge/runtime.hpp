@@ -105,15 +105,12 @@ struct ChannelSnapshot {
   double source_nsec{0.0};
   std::size_t requested_buffer{0};
   std::size_t actual_buffer{0};
-  std::vector<SteadyClock::time_point> event_times;
-  std::vector<double> lifetimes_ms;
   std::map<std::string, std::string> extra;
 };
 
 class DiagnosticsReporter {
  public:
-  DiagnosticsReporter(ros::NodeHandle node, const std::string& rich_topic,
-                      const std::string& high_hz_topic, double period);
+  DiagnosticsReporter(ros::NodeHandle node, const std::string& high_hz_topic);
   void addChannel(const std::string& name, const std::string& direction,
                   std::uint16_t port, const std::string& topic,
                   double stale_timeout);
@@ -122,7 +119,7 @@ class DiagnosticsReporter {
   void received(const std::string& name, const Datagram& datagram);
   void rejected(const std::string& name, const Datagram& datagram);
   void parseError(const std::string& name, const std::string& detail,
-                  const ros::Time& stamp);
+                  const ros::Time& stamp, std::size_t count = 1U);
   void valueAnomaly(const std::string& name, const std::string& detail,
                     const ros::Time& stamp);
   void recordChunk(const std::string& name);
@@ -130,7 +127,9 @@ class DiagnosticsReporter {
   void socketError(const std::string& name, const std::string& code,
                    const std::string& detail, const ros::Time& stamp);
   void ignored(const std::string& name, const std::string& code,
-               const ros::Time& stamp);
+               const ros::Time& stamp, std::size_t count = 1U);
+  void recordSelection(const std::string& name, std::size_t rejected,
+                       std::size_t non_target);
   void superseded(const std::string& name, std::size_t count);
   void dropped(const std::string& name, const std::string& reason,
                const ros::Time& stamp);
@@ -158,18 +157,13 @@ class DiagnosticsReporter {
  private:
   void transition(ChannelSnapshot& item, int level, const std::string& code,
                   const std::string& message, const ros::Time& stamp);
-  void recordLifetime(ChannelSnapshot& item, SteadyClock::time_point started);
   void publishHighHzLocked(ChannelSnapshot& channel, const ros::Time& stamp);
-  diagnostic_msgs::DiagnosticStatus statusLocked(const ChannelSnapshot& channel,
-                                                  bool rich) const;
-  void publishRich(const ros::WallTimerEvent&);
+  diagnostic_msgs::DiagnosticStatus statusLocked(const ChannelSnapshot& channel) const;
   ChannelSnapshot& channel(const std::string& name);
 
   mutable std::mutex mutex_;
   std::map<std::string, ChannelSnapshot> channels_;
-  ros::Publisher rich_publisher_;
   ros::Publisher high_hz_publisher_;
-  ros::WallTimer rich_timer_;
 };
 
 enum class SocketAction { kRetryImmediately, kKeep, kReopen };

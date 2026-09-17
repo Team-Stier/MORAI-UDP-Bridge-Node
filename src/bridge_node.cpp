@@ -253,8 +253,12 @@ class GpsBridge {
     std::size_t non_target = 0U;
     std::size_t selected = 0;
     GgaFix fix;
-    if (LatestDatagramSelector::selectNewestDecodable(batch, GpsParser::decodeStructure,
-          &fix, &selected, &rejected, &non_target)) {
+    const bool found = LatestDatagramSelector::selectNewestDecodable(batch, GpsParser::decodeStructure,
+          &fix, &selected, &rejected, &non_target);
+    reporter_->recordSelection("gps", rejected, non_target);
+    if (found && rejected > 0U)
+      reporter_->parseError("gps", "batch rejected=" + std::to_string(rejected), batch.back().ros_receipt, 0U);
+    if (found) {
         const Datagram& datagram = batch[selected];
         reporter_->superseded("gps", selected);
         const std::string anomaly = RxValueInspector::gps(fix);
@@ -268,8 +272,8 @@ class GpsBridge {
         return;
     }
     const ros::Time stamp = batch.back().ros_receipt;
-    if (non_target == batch.size()) reporter_->ignored("gps", "NON_GGA", stamp);
-    else reporter_->parseError("gps", "no structurally decodable GGA; rejected=" + std::to_string(rejected), stamp);
+    if (non_target == batch.size()) reporter_->ignored("gps", "NON_GGA", stamp, 0U);
+    else reporter_->parseError("gps", "no structurally decodable GGA; rejected=" + std::to_string(rejected), stamp, 0U);
   }
 
   void reset() {}
@@ -308,9 +312,13 @@ class ImuBridge {
   void handle(std::vector<Datagram> batch) {
     std::size_t selected = 0, rejected = 0, non_target = 0;
     ImuSample sample;
-    if (LatestDatagramSelector::selectNewestDecodable(batch,
+    const bool found = LatestDatagramSelector::selectNewestDecodable(batch,
           [this](const Datagram& packet) { return ImuParser::decodeStructure(packet, layout_); },
-          &sample, &selected, &rejected, &non_target)) {
+          &sample, &selected, &rejected, &non_target);
+    reporter_->recordSelection("imu", rejected, non_target);
+    if (found && rejected > 0U)
+      reporter_->parseError("imu", "batch rejected=" + std::to_string(rejected), batch.back().ros_receipt, 0U);
+    if (found) {
         const Datagram& datagram = batch[selected];
         reporter_->superseded("imu", selected);
         const std::string anomaly = RxValueInspector::imu(sample);
@@ -320,7 +328,7 @@ class ImuBridge {
                              sample.sec, sample.nsec);
         return;
     }
-    reporter_->parseError("imu", "no structurally decodable IMU packet", batch.back().ros_receipt);
+    reporter_->parseError("imu", "no structurally decodable IMU packet", batch.back().ros_receipt, 0U);
   }
   void reset() {}
 
@@ -364,8 +372,12 @@ class StatusBridge {
   void handle(std::vector<Datagram> batch) {
     std::size_t selected = 0, rejected = 0, non_target = 0;
     VehicleStatusSample sample;
-    if (LatestDatagramSelector::selectNewestDecodable(batch, StatusParser::decodeStructure,
-          &sample, &selected, &rejected, &non_target)) {
+    const bool found = LatestDatagramSelector::selectNewestDecodable(batch, StatusParser::decodeStructure,
+          &sample, &selected, &rejected, &non_target);
+    reporter_->recordSelection("status", rejected, non_target);
+    if (found && rejected > 0U)
+      reporter_->parseError("status", "batch rejected=" + std::to_string(rejected), batch.back().ros_receipt, 0U);
+    if (found) {
         const Datagram& datagram = batch[selected];
         reporter_->superseded("status", selected);
         const std::string anomaly = RxValueInspector::status(sample);
@@ -375,7 +387,7 @@ class StatusBridge {
                              sample.source_sec, sample.source_nsec);
         return;
     }
-    reporter_->parseError("status", "no structurally decodable status packet", batch.back().ros_receipt);
+    reporter_->parseError("status", "no structurally decodable status packet", batch.back().ros_receipt, 0U);
   }
   void reset() {}
 
@@ -529,9 +541,7 @@ class LampTx {
 class BridgeNode {
  public:
   BridgeNode() : node_(), private_("~"),
-      reporter_(node_, param(private_, "diagnostics_topic", std::string("/diagnostics")),
-                param(private_, "high_hz_diagnostics_topic", std::string("/diagnostics/high_hz")),
-                param(private_, "diagnostics_period", 1.0)) {
+      reporter_(node_, param(private_, "high_hz_diagnostics_topic", std::string("/diagnostics/high_hz"))) {
     setupRx();
     configureChannel("control_tx", "control", "tx", [this]() {
       ChannelConfigValidator::validateTx(private_, "control");
