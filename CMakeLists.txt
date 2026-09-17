@@ -32,7 +32,8 @@ install(TARGETS morai_udp_bridge_protocol morai_udp_bridge_runtime morai_udp_bri
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 install(DIRECTORY include/${PROJECT_NAME}/ DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION})
 install(DIRECTORY config docs launch DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})
-install(PROGRAMS launch.sh scripts/network_launch.py DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+install(PROGRAMS launch.sh scripts/network_launch.py scripts/monitor_packet_health.py
+  DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_gtest(test_protocol test/test_protocol.cpp)
