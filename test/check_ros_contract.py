@@ -58,7 +58,7 @@ def main():
         config.update(bind_ip="127.0.0.1", allowed_source_ip="127.0.0.1")
         config["vehicle_spec"] = dict(base_frame_id="base_link", gps_frame_id="gps", imu_frame_id="imu",
             cameras={name: dict(frame_id=name, width=640, height=480, horizontal_fov_deg=90.0)
-                     for name in ("front", "left", "right")})
+                     for name in config["cameras"]})
         for channel in list(config["cameras"].values()) + [config[name] for name in ("gps", "imu", "status")]:
             channel["port"] = free_port()
         config["control"].update(destination_ip="127.0.0.1", destination_port=free_port())
@@ -84,7 +84,8 @@ def main():
                                     stdout=node_log, stderr=subprocess.STDOUT)
 
         node = launch(config)
-        wait_for(lambda: command.get_num_connections() and "control_tx" in latest, "channels not initialized")
+        wait_for(lambda: command.get_num_connections() and "control_tx" in latest and
+                 "camera_camera_7" in latest, "channels not initialized")
         wait_for(lambda: latest["control_tx"].get("sent", "0") != "0", "TX not sending")
         assert latest["control_tx"]["error_code"] == "STALE_COMMAND", latest["control_tx"]
         assert all(key in latest["control_tx"] for key in ("state_since", "last_error_time", "last_transition_time", "command_age_ms"))

@@ -37,6 +37,12 @@ cameras:
     topic: /image/right/compressed
     camera_info_topic: /image/right/camera_info
     stale_timeout: 0.5
+  camera_7:
+    port: 9297
+    packet_layout: timestamped
+    topic: /image/camera_7/compressed
+    camera_info_topic: /image/camera_7/camera_info
+    stale_timeout: 0.5
 
 gps:
   enabled: true

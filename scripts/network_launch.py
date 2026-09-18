@@ -30,7 +30,20 @@ def assigned_interface(ip):
     return ""
 
 
-def detect_wired_interface():
+def detect_wired_interface(target_ip):
+    route = subprocess.run(
+        ["ip", "-o", "route", "get", target_ip],
+        capture_output=True, text=True,
+    )
+    fields = route.stdout.split()
+    if route.returncode == 0 and "dev" in fields:
+        index = fields.index("dev") + 1
+        if index < len(fields):
+            name = fields[index]
+            root = f"/sys/class/net/{name}"
+            if os.path.exists(f"{root}/device") and not os.path.exists(f"{root}/wireless"):
+                return name
+
     candidates = []
     for name in sorted(os.listdir("/sys/class/net")):
         root = f"/sys/class/net/{name}"
@@ -58,7 +71,7 @@ def configure_remote_interface(profile):
     simulator_ip = str(profile.get("simulator_ip", ""))
     interface = assigned_interface(bridge_ip)
     if not interface:
-        interface = str(profile.get("interface", "")) or detect_wired_interface()
+        interface = str(profile.get("interface", "")) or detect_wired_interface(simulator_ip)
         prefix = int(profile.get("prefix_length", 24))
         log(f"configuring wired NIC {interface}: {bridge_ip}/{prefix}")
         run_privileged(["ip", "link", "set", "dev", interface, "up"])

@@ -2,6 +2,7 @@
 """Selected profile starts immediately; no UDP probe or automatic fallback."""
 import importlib.util
 from pathlib import Path
+import subprocess
 import tempfile
 from unittest.mock import patch
 import yaml
@@ -13,6 +14,13 @@ spec.loader.exec_module(network)
 
 
 def main():
+    route = subprocess.CompletedProcess(
+        [], 0, stdout="192.168.0.1 dev enp5s0 src 192.168.0.10\n")
+    with patch.object(network.subprocess, "run", return_value=route), \
+            patch.object(network.os.path, "exists",
+                         side_effect=lambda path: path.endswith("/device")):
+        assert network.detect_wired_interface("192.168.0.1") == "enp5s0"
+
     for option in (1, 2):
         config = {"network_launch": {"launch_option": option, "same_pc": {}, "remote_pc": {}}}
         with tempfile.NamedTemporaryFile(mode="w+", suffix=".yaml") as stream:

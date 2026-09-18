@@ -597,9 +597,12 @@ class BridgeNode {
   }
 
   void setupRx() {
-    const std::string cameras[] = {"front", "left", "right"};
-    for (const std::string& camera : cameras) {
-      configureChannel("camera_" + camera, "cameras/" + camera, "rx", [this, &camera]() {
+    XmlRpc::XmlRpcValue cameras;
+    if (!private_.getParam("cameras", cameras) || cameras.getType() != XmlRpc::XmlRpcValue::TypeStruct)
+      throw std::runtime_error("cameras must be a mapping");
+    for (auto item = cameras.begin(); item != cameras.end(); ++item) {
+      const std::string camera = item->first;
+      configureChannel("camera_" + camera, "cameras/" + camera, "rx", [this, camera]() {
       const std::string prefix = "cameras/" + camera + "/";
       const int port = requiredParam<int>(private_, prefix + "port");
       const std::string topic = requiredParam<std::string>(private_, prefix + "topic");
