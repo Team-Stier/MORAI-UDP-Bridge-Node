@@ -9,7 +9,7 @@ network_launch:
   remote_pc:
     # Set these to the wired-LAN addresses before using option 2/fallback.
     bridge_ip: "192.168.0.20"
-    simulator_ip: "192.168.0.8"
+    simulator_ip: "192.168.0.1"
     prefix_length: 24
 
 bind_ip: 0.0.0.0
@@ -46,14 +46,14 @@ gps:
 
 imu:
   enabled: true
-  port: 999
+  port: 9999
   packet_layout: timestamped
   topic: /sensors/imu/data
   stale_timeout: 0.5
 
 status:
   enabled: true
-  port: 909
+  port: 9099
   topic: /vehicle/competition_status
   stale_timeout: 0.25
 
