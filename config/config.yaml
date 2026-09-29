@@ -1,4 +1,4 @@
-# Package-local defaults. Workspace run.sh may overwrite vehicle_spec keys.
+# Package-local defaults and MORAI vehicle/sensor runtime configuration.
 network_launch:
   # 1: same-PC. 2: remote-PC.
   launch_option: 2
@@ -8,7 +8,7 @@ network_launch:
     simulator_ip: 192.168.0.8
   remote_pc:
     # Set these to the wired-LAN addresses before using option 2/fallback.
-    bridge_ip: "192.168.0.20"
+    bridge_ip: "192.168.0.10"
     simulator_ip: "192.168.0.1"
     prefix_length: 24
 
@@ -79,3 +79,29 @@ lamp_control:
   # Set the MORAI Network Settings Lamp Control port before enabling.
   destination_port: 0
   send_error_reopen_threshold: 3
+
+vehicle_spec:
+  base_frame_id: base_link
+  gps_frame_id: gps_link
+  imu_frame_id: imu_link
+  cameras:
+    front:
+      frame_id: camera_front_optical_frame
+      width: 1280
+      height: 720
+      horizontal_fov_deg: 90.0
+    left:
+      frame_id: camera_left_optical_frame
+      width: 640
+      height: 480
+      horizontal_fov_deg: 130.0
+    right:
+      frame_id: camera_right_optical_frame
+      width: 640
+      height: 480
+      horizontal_fov_deg: 130.0
+    camera_7:
+      frame_id: camera_7_optical_frame
+      width: 640
+      height: 480
+      horizontal_fov_deg: 90.0

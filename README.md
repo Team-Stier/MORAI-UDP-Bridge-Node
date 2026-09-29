@@ -40,12 +40,11 @@ MORAI msg를 다시 정의하지 않는다.
 기본 운행 값은 이 패키지 [`config/config.yaml`](config/config.yaml)이다.
 포트, 토픽, stale, send rate, diagnostics 토픽을 여기서 관리한다.
 
-차량 제원처럼 여러 실행 패키지가 같이 쓰는 값은 메인 `catkin_ws`의 전역
-config에 두고, 전역 `run.sh`가 각 실행 패키지 config에 주입한다.
-이 노드가 `ioniq5_description` YAML을 `sensor_setup`으로 직접 로드하지 않는다.
-
-주입 예: `vehicle_spec`(최대 조향각, frame_id, 카메라 폭/높이/FOV).
-주입 키는 전역 config가 권위다. 패키지 YAML의 같은 키는 기본값일 뿐이다.
+이 패키지에서 사용하는 MORAI 차량·센서 설정은 `vehicle_spec` 아래에 둔다.
+`run.sh`는 패키지 [`config/config.yaml`](config/config.yaml)을 `network_launch.py`에
+직접 넘기며 별도 workspace 설정을 병합하지 않는다. 다른 노드에 설정값을 주입하지
+않는다. 공용 frame 의미와 좌표 계약은 저장소 루트 README를 따른다. 이 노드는
+`ioniq5_description` YAML을 `sensor_setup`으로 직접 로드하지 않는다.
 
 ### 실행
 
@@ -629,7 +628,7 @@ frame 사이를 변환하지 않는다.
 
 공식 기준: [MORAI 맵 좌표계](https://help-morai-sim.scrollhelp.site/ko/morai-sim-drive/24.R2/-9),
 [MORAI 센서 좌표계](https://help-morai-sim.scrollhelp.site/ko/morai-sim-drive/24.R2/-8).
-`frame_id`는 이 좌표 의미와 일치하도록 전역 `vehicle_spec`에서 주입한다.
+`frame_id`는 이 좌표 의미와 일치하도록 패키지 `config/config.yaml`의 `vehicle_spec`에서 정한다.
 
 ### Camera packet ↔ CompressedImage / CameraInfo
 
@@ -695,7 +694,7 @@ datagram 끝의 2B tail 전까지 있는 고정 datagram padding은 버린다. `
 
 | ROS 필드 | 값 |
 | --- | --- |
-| `width`, `height` | 전역 `vehicle_spec` 주입값 |
+| `width`, `height` | 패키지 `config/config.yaml`의 `vehicle_spec` 값 |
 | `distortion_model` | `plumb_bob` |
 | `D` | distortion 정보가 없으므로 5개 0 |
 | `K` | `fx=fy=width/(2*tan(horizontal_fov/2))`, `cx=width/2`, `cy=height/2` 기본값 |
