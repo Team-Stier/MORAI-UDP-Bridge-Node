@@ -178,7 +178,7 @@ respawn도 동작하지 않으므로 메인 `run.sh`는 `launch.sh` 프로세스
 - 이 패키지는 MORAI wire 변환만 담당하는 실행 패키지다. 경로 추종, 속도 제어, 기어 판단, localization 판단을 넣지 않는다.
 - 이 패키지는 전역 workspace에서 catkin_ws/src/@MORAI-UDP-Bridge_Node 로 깃 서브모듈 링크된다.
 - 실행 패키지끼리 코드·launch 의존성을 만들지 않고 ROS 토픽으로만 연결한다. 커스텀 msg는 서비스 패키지 `catkin_ws/src/interfaces`에만 둔다.
-- package 기본값은 `config/config.yaml`, 공용 차량 제원은 workspace 전역 config와 `run.sh` 주입값이 권위다. `ioniq5_description` 방식은 사용하지 않는다.
+- 설정은 패키지 `config/config.yaml`을 사용하며, 선택한 network profile의 주소를 임시 설정에 주입한다. 차량·센서 제원은 이 설정의 `vehicle_spec`을 따른다. `ioniq5_description` 방식은 사용하지 않는다.
 - RX는 포트별 socket·worker thread·오류 상태를 완전히 분리하고, TX 50Hz timer도 RX와 독립 실행한다. 한 채널 오류로 다른 채널이나 프로세스를 종료하지 않는다.
 - front/left/right 카메라는 socket, worker, parser, assembler, 진단 상태까지 서로 독립이다.
 - 단일 datagram 센서(GPS, IMU, status)는 socket backlog를 nonblocking으로 비운 뒤 newest-to-oldest 순서로 확인해 가장 최근의 structurally decodable datagram 하나만 처리한다. 건너뛴 datagram은 `superseded_count`로 기록한다.
@@ -227,7 +227,7 @@ sequenceDiagram
     participant Topic as channel ROS topic
     participant HighHzTopic as /diagnostics/high_hz
 
-    Note over Worker,Bridge: camera front :9291, left :9293, right :9295 are fully independent<br/>GPS :9301, IMU :9303, status :9094
+    Note over Worker,Bridge: camera front :9291, left :9293, right :9295, camera_7 :9297 are fully independent<br/>GPS :9301, IMU :9999, status :9099
     Config->>ConfigValidator: validate RX port, topic, frame/calibration
     alt channel config unusable
         ConfigValidator->>Reporter: error(CONFIG_ERROR), disable only this channel
@@ -605,9 +605,11 @@ RX 발행에는 rate 상한이 없다. 수신과 조립 완료에 따라 발행�
 | RX | Camera left info | 9293과 같은 frame | `/image/left/camera_info` | `sensor_msgs/CameraInfo` |
 | RX | Camera right | 9295 | `/image/right/compressed` | `sensor_msgs/CompressedImage` |
 | RX | Camera right info | 9295와 같은 frame | `/image/right/camera_info` | `sensor_msgs/CameraInfo` |
+| RX | Camera camera_7 | 9297 | `/image/camera_7/compressed` | `sensor_msgs/CompressedImage` |
+| RX | Camera camera_7 info | 9297과 같은 frame | `/image/camera_7/camera_info` | `sensor_msgs/CameraInfo` |
 | RX | GPS | 9301 | `/sensors/gps/fix` | `sensor_msgs/NavSatFix` |
-| RX | IMU | 9303 | `/sensors/imu/data` | `sensor_msgs/Imu` |
-| RX | Competition Vehicle Status | 9094 | `/vehicle/competition_status` | `interfaces/CompetitionVehicleStatus` |
+| RX | IMU | 9999 | `/sensors/imu/data` | `sensor_msgs/Imu` |
+| RX | Competition Vehicle Status | 9099 | `/vehicle/competition_status` | `interfaces/CompetitionVehicleStatus` |
 | TX | Ego Ctrl Cmd | 9093 | `/morai_udp_bridge/control_cmd`에서 입력 | `morai_msgs/CtrlCmd` |
 | TX | Turn Signal Lamp Control | MORAI Network Settings에서 지정 | `/morai_udp_bridge/lamp_cmd`에서 입력 | `morai_msgs/Lamps` |
 | 내부 | 진단 high-rate | 해당 없음 | `/diagnostics/high_hz` | `diagnostic_msgs/DiagnosticArray` |
@@ -624,7 +626,7 @@ frame 사이를 변환하지 않는다.
 | GPS NMEA | WGS84 geodetic latitude/longitude | latitude North 양수, South 음수; longitude East 양수, West 음수 | NMEA degree-minute 표기만 decimal degree로 바꿔 `NavSatFix`에 기록 |
 | MORAI GPS/map projection | 문서상 UTM zone 52N, WGS84, EPSG:32652 | Easting/Northing m | bridge는 UTM을 발행하지 않음; WGS84↔UTM은 localization/projector 책임 |
 | Competition status rotation | global ENU의 roll/pitch/yaw | wire 단위 degree | 아래 명세의 명시적 degree↔radian 표현 변환만 허용 |
-| Ego Ctrl steering | 차량 최대 조향각으로 정규화된 `[-1,1]` | 차량별 wire 부호는 주입된 `steering_sign`으로 고정 | 운행 중 부호를 추론하거나 자동 보정하지 않음 |
+| Ego Ctrl steering | 차량 최대 조향각으로 정규화된 `[-1,1]` | sanitize된 입력값의 부호 유지 | encoder가 정규화 steering을 그대로 직렬화하며 부호 추론·자동 보정 없음 |
 
 공식 기준: [MORAI 맵 좌표계](https://help-morai-sim.scrollhelp.site/ko/morai-sim-drive/24.R2/-9),
 [MORAI 센서 좌표계](https://help-morai-sim.scrollhelp.site/ko/morai-sim-drive/24.R2/-8).
